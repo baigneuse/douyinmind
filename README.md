@@ -27,6 +27,8 @@ DouyinMind 从你选择的视频中提取声音，保存带时间信息的完整
 
 > 当前默认只分析声音，优先完善文字稿和问答。画面分析是可选配置；识别和回答仍可能出错，关键内容请结合原文及原视频核对。
 
+本 Fork 的 [Phase 1 本地导入 CLI](docs/LOCAL_MEDIA_IMPORT.md) 支持 MP4 / MP3 / M4A / WAV 与 SRT/VTT，默认离线输出带毫秒时间戳的逐字稿和 Markdown 文件，重跑保留人工笔记。已完成[公开媒体与已有字幕验收](docs/PHASE1_ACCEPTANCE.md)；真实云端 ASR 和 AI 总结尚未验收，本地导入尚未接入网页知识库。实现、测试和已知阻断见 [Phase 1 报告](docs/PHASE1_REPORT.md)。
+
 ## 界面预览
 
 <p align="center">

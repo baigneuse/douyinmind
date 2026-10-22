@@ -88,15 +88,16 @@ def probe_audio(path: Path) -> float:
 
 
 @contextmanager
-def prepare_audio_segments(path: Path) -> Iterator[tuple[float, Iterator[AudioSegment]]]:
+def prepare_audio_segments(path: Path, *, configuration=None) -> Iterator[tuple[float, Iterator[AudioSegment]]]:
+    config = configuration if configuration is not None else settings
     duration = probe_audio(path)
-    parent = Path(settings.audio_cache_dir)
+    parent = Path(config.audio_cache_dir)
     parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="segments-", dir=parent) as folder:
         def segments():
-            for index in range(math.ceil(duration / settings.video_segment_seconds)):
-                start = index * settings.video_segment_seconds
-                length = min(settings.video_segment_seconds, duration - start)
+            for index in range(math.ceil(duration / config.video_segment_seconds)):
+                start = index * config.video_segment_seconds
+                length = min(config.video_segment_seconds, duration - start)
                 target = Path(folder) / f"part-{index:04d}.wav"
                 result = subprocess.run([
                     _resolve_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",

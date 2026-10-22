@@ -38,6 +38,14 @@ frontend/dist/
 # 本地数据
 backend/app/storage/
 logs/
+**/local-media-*/
+*.mp4
+*.mp3
+*.m4a
+*.wav
+*.srt
+*.vtt
+.phase1-known-defect-tmp/
 
 # 本机实验、私人考卷/验收脚本不发布；保留可复用的通用工具
 backend/scripts/*
@@ -49,6 +57,7 @@ backend/scripts/*
 !backend/scripts/render_answer_report.py
 !backend/scripts/long_video_test.py
 !backend/scripts/observe_ingestion.py
+!backend/scripts/import_local.py
 backend/tests/test_journal*.py
 
 # 原本机界面截图含实际收藏夹名称；原图留在本地

@@ -4,6 +4,7 @@
 基于 Pydantic Settings 的环境变量管理。
 所有配置项从 .env 文件和环境变量读取，提供类型验证和默认值。
 """
+import os
 from pathlib import Path
 from typing import Literal
 from pydantic import Field
@@ -153,4 +154,6 @@ class Settings(BaseSettings):
 
 
 # 全局单例
-settings = Settings()
+# The local-import CLI opts out before importing app modules. Existing web
+# startup still reads its .env exactly as before.
+settings = Settings(_env_file=None) if os.environ.get("DOUYINMIND_NO_DOTENV") == "1" else Settings()

@@ -125,13 +125,15 @@ warnings 只记录确实遇到的画面识别不确定性。
 
 
 class OmniService:
-    def __init__(self) -> None:
+    def __init__(self, configuration=None) -> None:
+        self._settings = configuration if configuration is not None else settings
+        self._custom_configuration = configuration is not None
         self._client: OpenAI | None = None
         self._client_lock = Lock()
         self._request_context = local()
 
     def check_configuration(self) -> None:
-        if not (settings.qwen_omni_api_key or settings.dashscope_api_key).strip():
+        if not (self._settings.qwen_omni_api_key or self._settings.dashscope_api_key).strip():
             raise OmniServiceError("请先在本地配置文件中填写千问服务密钥。")
 
     def _get_client(self) -> OpenAI:
@@ -139,9 +141,9 @@ class OmniService:
         with self._client_lock:
             if self._client is None:
                 self._client = OpenAI(
-                    api_key=settings.qwen_omni_api_key or settings.dashscope_api_key,
-                    base_url=settings.qwen_omni_base_url,
-                    timeout=settings.qwen_omni_timeout,
+                    api_key=self._settings.qwen_omni_api_key or self._settings.dashscope_api_key,
+                    base_url=self._settings.qwen_omni_base_url,
+                    timeout=self._settings.qwen_omni_timeout,
                     max_retries=1,
                 )
         return self._client
@@ -160,12 +162,12 @@ class OmniService:
                     raise OmniServiceError("补听预算已到，保留原文字稿。", code="boundary_review_timeout")
                 # A request-scoped SDK clone shares the existing transport but
                 # does not mutate the root transcription client's retry policy.
-                client = client.with_options(timeout=min(settings.audio_boundary_review_timeout_seconds, remaining), max_retries=0)
+                client = client.with_options(timeout=min(self._settings.audio_boundary_review_timeout_seconds, remaining), max_retries=0)
             stream = client.chat.completions.create(
-                model=settings.qwen_omni_model,
+                model=self._settings.qwen_omni_model,
                 messages=[{"role": "user", "content": content}],
                 modalities=["text"], reasoning_effort="none",
-                stream=True, max_tokens=settings.qwen_omni_max_tokens,
+                stream=True, max_tokens=self._settings.qwen_omni_max_tokens,
                 stream_options={"include_usage": True},
             )
             try:
@@ -305,15 +307,15 @@ class OmniService:
     def analyze_audio(self, path: Path, progress: Callable[[int, int], None] | None = None) -> VideoAnalysis:
         self.check_configuration()
         speech, warnings, raw_results, root_groups = [], [], [], []
-        processing = {"segment_seconds": settings.video_segment_seconds,
-                      "concurrency": settings.audio_transcription_concurrency,
+        processing = {"segment_seconds": self._settings.video_segment_seconds,
+                      "concurrency": self._settings.audio_transcription_concurrency,
                       "reused_root_segments": 0, "new_root_segments": 0,
                       "reused_child_segments": 0,
                       "recognition_attempts": 0, "failed_recognition_attempts": 0}
         checkpoint = AudioCheckpoint(path, {
-            "schema_version": 1, "model": settings.qwen_omni_model,
-            "endpoint": settings.qwen_omni_base_url, "prompt": AUDIO_PROMPT,
-            "max_tokens": settings.qwen_omni_max_tokens, "segment_seconds": settings.video_segment_seconds,
+            "schema_version": 1, "model": self._settings.qwen_omni_model,
+            "endpoint": self._settings.qwen_omni_base_url, "prompt": AUDIO_PROMPT,
+            "max_tokens": self._settings.qwen_omni_max_tokens, "segment_seconds": self._settings.video_segment_seconds,
         })
 
         def recognize(segment):
@@ -351,9 +353,11 @@ class OmniService:
                     checkpoint.record_success(segment, result.model_dump(), raw)
             return result, raw, bool(saved), attempts, failures, reused_children
 
-        with prepare_audio_segments(path) as (duration, segments):
-            count = math.ceil(duration / settings.video_segment_seconds)
-            concurrency = min(settings.audio_transcription_concurrency, count)
+        prepared = (prepare_audio_segments(path, configuration=self._settings)
+                    if self._custom_configuration else prepare_audio_segments(path))
+        with prepared as (duration, segments):
+            count = math.ceil(duration / self._settings.video_segment_seconds)
+            concurrency = min(self._settings.audio_transcription_concurrency, count)
             processing["concurrency"] = concurrency
             processing["total_root_segments"] = count
             completed = {}
@@ -427,7 +431,7 @@ class OmniService:
                                     "audio_response": raw})
         speech.sort(key=lambda item: item["start_seconds"])
         boundary_review = None
-        if settings.audio_boundary_review_enabled and settings.audio_boundary_review_max_windows:
+        if self._settings.audio_boundary_review_enabled and self._settings.audio_boundary_review_max_windows:
             speech, boundary_review = self._review_audio_boundaries(path, duration, root_groups)
             if boundary_review["reviews"]:
                 warnings.append(f"已检查{len(boundary_review['reviews'])}处交界，新增模型请求{boundary_review['recognition_attempts']}次、"
@@ -441,7 +445,7 @@ class OmniService:
             processing["boundary_review_attempts"] = 0
             processing["boundary_review_reused_windows"] = 0
         processing["total_recognition_attempts"] = processing["recognition_attempts"] + processing["boundary_review_attempts"]
-        payload = {"schema_version": 1, "analysis_mode": "audio", "model": settings.qwen_omni_model,
+        payload = {"schema_version": 1, "analysis_mode": "audio", "model": self._settings.qwen_omni_model,
                    "duration_seconds": duration, "transcript_segments": speech, "visual_segments": [],
                    "warnings": warnings, "raw_results": raw_results,
                    "audio_processing": processing}
@@ -451,23 +455,23 @@ class OmniService:
 
     def _review_audio_boundaries(self, path: Path, duration: float, roots: list[dict]) -> tuple[list[dict], dict]:
         """Optional bounded re-listening. Failure never discards completed roots."""
-        if settings.audio_boundary_batch_enabled:
+        if self._settings.audio_boundary_batch_enabled:
             from app.services.audio_boundary_packs import review_boundary_packs
             return review_boundary_packs(self, path, duration, roots)
         started = time.monotonic()
         original = [part for root in roots for part in root["parts"]]
         audit = {"strategy": STRATEGY_VERSION, "acoustic_status": "unverified_acoustic",
-                 "max_windows": settings.audio_boundary_review_max_windows,
-                 "window_timeout_seconds": settings.audio_boundary_review_timeout_seconds,
-                 "stage_admission_budget_seconds": settings.audio_boundary_review_budget_seconds,
+                 "max_windows": self._settings.audio_boundary_review_max_windows,
+                 "window_timeout_seconds": self._settings.audio_boundary_review_timeout_seconds,
+                 "stage_admission_budget_seconds": self._settings.audio_boundary_review_budget_seconds,
                  "sdk_retries": 0,
                  "recognition_attempts": 0, "failed_recognition_attempts": 0, "reused_windows": 0,
                  "http_attempts": None, "reviews": [], "original_transcript_segments": original}
-        candidates = select_boundary_candidates(roots, settings.audio_boundary_review_max_windows)
-        fingerprint = {"strategy": STRATEGY_VERSION, "model": settings.qwen_omni_model,
-            "endpoint": settings.qwen_omni_base_url, "prompt": AUDIO_PROMPT,
-            "max_tokens": settings.qwen_omni_max_tokens,
-            "radius": settings.audio_boundary_review_radius_seconds,
+        candidates = select_boundary_candidates(roots, self._settings.audio_boundary_review_max_windows)
+        fingerprint = {"strategy": STRATEGY_VERSION, "model": self._settings.qwen_omni_model,
+            "endpoint": self._settings.qwen_omni_base_url, "prompt": AUDIO_PROMPT,
+            "max_tokens": self._settings.qwen_omni_max_tokens,
+            "radius": self._settings.audio_boundary_review_radius_seconds,
             "original_roots_sha256": hashlib.sha256(json.dumps(roots, ensure_ascii=False, sort_keys=True).encode()).hexdigest()}
         try:
             checkpoint = AudioCheckpoint(path, fingerprint, namespace="boundary-analysis")
@@ -487,10 +491,10 @@ class OmniService:
             audit["reviews"].append(entry)
             began = time.monotonic()
             try:
-                if began - started >= settings.audio_boundary_review_budget_seconds:
+                if began - started >= self._settings.audio_boundary_review_budget_seconds:
                     entry["reason"] = "stage_budget_exhausted"
                     continue
-                radius = settings.audio_boundary_review_radius_seconds
+                radius = self._settings.audio_boundary_review_radius_seconds
                 with prepare_audio_window(path, max(0, boundary - radius), min(duration, boundary + radius)) as segment:
                     entry.update(start_seconds=segment.start, duration_seconds=segment.duration)
                     entry["pcm_window_sha256"] = hashlib.sha256(segment.path.read_bytes()).hexdigest()
@@ -505,14 +509,14 @@ class OmniService:
                         except (ValueError, KeyError, TypeError):
                             saved = None
                     if saved is None:
-                        remaining = settings.audio_boundary_review_budget_seconds - (time.monotonic() - started)
+                        remaining = self._settings.audio_boundary_review_budget_seconds - (time.monotonic() - started)
                         if remaining <= 0:
                             entry["reason"] = "stage_budget_exhausted"
                             continue
                         audit["recognition_attempts"] += 1
                         try:
                             self._request_context.boundary_deadline = time.monotonic() + min(
-                                settings.audio_boundary_review_timeout_seconds, remaining)
+                                self._settings.audio_boundary_review_timeout_seconds, remaining)
                             try:
                                 result, raw = self._analyze_audio_segment(segment)
                             finally:
@@ -615,7 +619,7 @@ class OmniService:
         warnings: list[str] = []
         raw_results: list[dict] = []
         with prepare_video_segments(path) as (info, segments):
-            count = math.ceil(info.duration / settings.video_segment_seconds)
+            count = math.ceil(info.duration / self._settings.video_segment_seconds)
             for index, segment in enumerate(segments):
                 if progress:
                     progress(index + 1, count)
@@ -637,7 +641,7 @@ class OmniService:
             + (f"\n画面文字：{item['visible_text']}" if item["visible_text"] else "")
             for item in visuals
         )
-        payload = {"schema_version": 1, "analysis_mode": "audio_visual", "model": settings.qwen_omni_model,
+        payload = {"schema_version": 1, "analysis_mode": "audio_visual", "model": self._settings.qwen_omni_model,
                    "duration_seconds": duration, "transcript_segments": speech,
                    "visual_segments": visuals, "warnings": warnings, "raw_results": raw_results}
         return VideoAnalysis(transcript, visual_text, payload)
