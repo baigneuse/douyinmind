@@ -3,11 +3,11 @@
 </p>
 
 <p align="center">
-  <strong>把抖音收藏夹，变成可以搜索、回看和提问的个人知识库。</strong>
+  <strong>把多个平台的视频来源，收集到自己的本机资料库。</strong>
 </p>
 
 <p align="center">
-  选择视频 · 保留完整文字稿 · 根据原文回答 · 回查引用来源
+  粘贴分享链接 · 整理标签与备注 · 按需下载 · 本地回看
 </p>
 
 <p align="center">
@@ -21,6 +21,10 @@
 
 ---
 
+本 Fork 当前优先完善网络视频的收集、整理、下载和回看。启动后首页进入视频资料库，不需要模型密钥；转写、逐字稿和 AI 总结暂不扩展。首先阅读[网络视频资料库使用说明](docs/NETWORK_VIDEO_LIBRARY.md)与[真实样例验收报告](docs/NETWORK_VIDEO_REPORT.md)。
+
+原项目的抖音收藏与知识库功能仍保留，下面涉及转写和问答的说明属于原有工作流：
+
 收藏了很多视频，却很难再找到当时讲过的那句话？
 
 DouyinMind 从你选择的视频中提取声音，保存带时间信息的完整文字稿，再从这些资料里找原文、生成回答。你可以按主题整理知识库，继续追问，并打开引用的视频核对内容。
@@ -28,6 +32,10 @@ DouyinMind 从你选择的视频中提取声音，保存带时间信息的完整
 > 当前默认只分析声音，优先完善文字稿和问答。画面分析是可选配置；识别和回答仍可能出错，关键内容请结合原文及原视频核对。
 
 本 Fork 的 [Phase 1 本地导入 CLI](docs/LOCAL_MEDIA_IMPORT.md) 支持 MP4 / MP3 / M4A / WAV 与 SRT/VTT，默认离线输出带毫秒时间戳的逐字稿和 Markdown 文件，重跑保留人工笔记。已完成[公开媒体与已有字幕验收](docs/PHASE1_ACCEPTANCE.md)；真实云端 ASR 和 AI 总结尚未验收，本地导入尚未接入网页知识库。实现、测试和已知阻断见 [Phase 1 报告](docs/PHASE1_REPORT.md)。
+
+**当前主入口改为[视频资料库](http://127.0.0.1:5173/#videos)**：启动项目后即可粘贴多行分享文字，一次最多保存 20 条来源链接，再搜索、编辑标题/标签/备注、星标或可逆归档。保存链接不访问原站，也不自动下载；只有单独点击下载才发起网络请求。首批整理抖音、Bilibili、YouTube 及 MP4/WebM 直链，下载可用性按实际验收结果确认，不能把“链接可保存”当作“视频可下载”。资料库不获取登录或 Cookie，不执行转写和 AI 总结。旧工具保留在 [本地已有字幕工具](http://127.0.0.1:5173/#local) 和 [原抖音知识库](http://127.0.0.1:5173/#douyin)。
+
+**Phase 2 新增[本地媒体工作台](docs/LOCAL_MEDIA_UI.md)**：启动项目后打开 [http://127.0.0.1:5173/#local](http://127.0.0.1:5173/#local)，无需登录抖音，即可选择本地媒体与字幕、查看任务、播放原片并按毫秒时间跳转、搜索逐字稿、保存人工笔记和导出五份文件。网页单文件限制为 500 MiB / 30 分钟，字幕不超过 10 MiB；默认使用已有字幕，Qwen 声音识别须配置服务并逐次明确授权。真实云端识别尚未验收，AI 总结关闭，本地资料未接入 RAG，也不会自动迁移旧 CLI 结果。启动、数据位置和恢复步骤见[使用说明](docs/LOCAL_MEDIA_UI.md)，验证证据与剩余限制见 [Phase 2 报告](docs/PHASE2_REPORT.md)。
 
 ## 界面预览
 
@@ -95,7 +103,7 @@ DouyinMind 从你选择的视频中提取声音，保存带时间信息的完整
 ### 2. 下载项目并安装后台
 
 ```powershell
-git clone https://github.com/MQTQW/douyinmind.git
+git clone https://github.com/baigneuse/douyinmind.git
 cd douyinmind/backend
 
 python -m pip install uv
@@ -106,7 +114,7 @@ uv run playwright install chromium
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-打开本地 `backend/.env`，填写自己的服务密钥：
+仅使用网络视频资料库不需要以下模型密钥，也不需要 Playwright 登录。只有使用原知识库或云端识别时，才需要打开本地 `backend/.env`，配置对应服务：
 
 | 配置 | 用途 |
 | --- | --- |

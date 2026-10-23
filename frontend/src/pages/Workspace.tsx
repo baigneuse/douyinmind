@@ -6,9 +6,9 @@ import { subscribePageReturn } from '../pageRefresh';
 import { BookOpen, ChevronLeft, Download, Files, LogOut, Menu, MessagesSquare, Plus } from 'lucide-react';
 import type { WorkspaceView } from '../workspaceView';
 
-interface Props { onLogout: () => void; loggedIn: boolean; }
+interface Props { onLogout: () => void; loggedIn: boolean; onOpenLocal: () => void; onOpenVideos: () => void; active: boolean; }
 
-export default function Workspace({ onLogout, loggedIn }: Props) {
+export default function Workspace({ onLogout, loggedIn, onOpenLocal, onOpenVideos, active }: Props) {
   const [leftWidth, setLeftWidth] = useState(272);
   const [view, setView] = useState<WorkspaceView>('chat');
   const [contentContainer, setContentContainer] = useState<HTMLDivElement | null>(null);
@@ -92,6 +92,7 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
 
   // Poll login status for detailed message
   useEffect(() => {
+    if (!active) return;
     const poll = setInterval(async () => {
       try {
         const s = await api.loginStatus();
@@ -99,7 +100,7 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
       } catch {}
     }, 3000);
     return () => clearInterval(poll);
-  }, []);
+  }, [active]);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -183,6 +184,8 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
               {selectedKnowledgeBase && (view === 'chat' || view === 'materials') && <p className="mt-1 text-xs text-[var(--color-ink-muted)]">{selectedKnowledgeBase.video_count} 个视频 · {selectedKnowledgeBase.ready_count} 个可提问</p>}
             </div>
             <div className="flex flex-wrap gap-2">
+              <button onClick={onOpenVideos} disabled={chatBusy} className="ui-button ui-button-primary"><Files size={16} />视频资料库</button>
+              <button onClick={onOpenLocal} disabled={chatBusy} className="ui-button"><Files size={16} />本地字幕工具</button>
               <button onClick={startNewChat} disabled={chatBusy} className="ui-button"><Plus size={16} />新对话</button>
               {loggedIn && <button onClick={() => setView('collections')} disabled={chatBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
             </div>

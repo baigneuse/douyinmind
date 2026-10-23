@@ -11,11 +11,13 @@ dependencies = [
     "dashscope>=1.20",
     "openai>=1.60",
     "httpx>=0.28",
-    "yt-dlp>=2024.0",
+    "yt-dlp==2026.10.21",
     "playwright>=1.50",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "loguru>=0.7",
+    "yt-dlp-ejs==0.8.0",
+    "deno==2.9.8",
 ]
 
 [project.optional-dependencies]

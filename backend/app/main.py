@@ -56,6 +56,10 @@ async def lifespan(app: FastAPI):
     logger.info("数据库表初始化完成")
 
     # 启动后台 worker
+    from app.services.local_media_workspace import get_workspace
+    get_workspace()  # Marks interrupted local jobs; never resumes cloud calls.
+    from app.services.network_library import get_network_library
+    get_network_library()  # Recover download attempts without fetching remote URLs.
     from app.services.worker import worker
     worker.start()
     logger.info("后台工作线程已启动")

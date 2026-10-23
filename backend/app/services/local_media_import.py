@@ -16,8 +16,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Callable
 from urllib.parse import urlsplit
+
+from app.services.import_runtime import ImportControl, ProviderConfig, RuntimeControlError
 
 PIPELINE_VERSION = "local-media-v1"
 NORMALIZATION_VERSION = "pcm16-mono-16k-v1"
@@ -51,6 +54,9 @@ class ImportOptions:
     segment_seconds: int = 60
     concurrency: int = 3
     title: str = ""
+    max_duration_ms: int = MAX_DURATION_MS
+    source_display_name: str = ""
+    subtitle_display_name: str = ""
 
 
 def file_sha256(path: Path) -> str:
@@ -138,15 +144,37 @@ def _endpoint(value: str) -> str:
     return value.rstrip("/")
 
 
-def _credentials(name: str, fallback: str | None = None) -> str:
-    value = (os.environ.get(name) or (os.environ.get(fallback) if fallback else "") or "").strip()
+def _credentials(name: str, fallback: str | None = None, *, explicit: str | None = None) -> str:
+    value = (explicit if explicit is not None else (os.environ.get(name) or (os.environ.get(fallback) if fallback else "") or "")).strip()
     if not value or value.startswith(("sk-your-", "your-", "offline-", "unit-", "synthetic-")):
         raise LocalImportError("BLOCKED：没有显式配置有效服务凭证；未发送媒体或文本。",
                                "missing_credentials", 3)
     return value
 
 
-def _normalize(source: Path, cache: Path) -> tuple[Path, int]:
+def _process(arguments, *, control=None, timeout=300):
+    if control is None:
+        return subprocess.run(arguments, capture_output=True, timeout=timeout)
+    control.check()
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    began = time.monotonic()
+    try:
+        while True:
+            control.check()
+            if time.monotonic() - began > timeout:
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=.2)
+                return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+
+def _normalize(source: Path, cache: Path, *, control=None, max_duration_ms=MAX_DURATION_MS) -> tuple[Path, int]:
     """Only copied media is passed to ffmpeg; a forced demuxer forbids playlists."""
     from app.services.media_service import MediaPipelineError, _resolve_ffmpeg_path, _valid_wav
     from app.services.audio_media import probe_audio
@@ -158,25 +186,28 @@ def _normalize(source: Path, cache: Path) -> tuple[Path, int]:
     with tempfile.TemporaryDirectory(prefix="source-", dir=cache) as folder:
         owned = Path(folder) / ("input" + source.suffix.lower())
         with source.open("rb") as incoming, owned.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+            for block in iter(lambda: incoming.read(1024 * 1024), b""):
+                if control is not None:
+                    control.check()
+                outgoing.write(block)
         if file_sha256(owned) != file_sha256(source):
             raise LocalImportError("复制期间原文件发生变化，请在文件稳定后重试。", "source_changed")
         arguments = [executable, "-hide_banner", "-nostdin", "-protocol_whitelist", "file,pipe",
                      "-f", FORMATS[source.suffix.lower()], "-i", str(owned)]
-        probe = subprocess.run(arguments, capture_output=True, timeout=30)
+        probe = _process(arguments, control=control, timeout=30)
         description = probe.stderr.decode("utf-8", errors="replace")
         duration = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", description)
         if not duration or "Audio:" not in description:
             raise LocalImportError("媒体无法解码或不包含音轨。", "invalid_media", 2)
         hours, minutes, seconds = map(float, duration.groups())
         length = (hours * 3600 + minutes * 60 + seconds) * 1000
-        if not math.isfinite(length) or not 0 < length <= MAX_DURATION_MS:
-            raise LocalImportError("媒体时长必须大于零且不超过三小时。", "invalid_duration", 2)
+        if not math.isfinite(length) or not 0 < length <= min(MAX_DURATION_MS, max_duration_ms):
+            raise LocalImportError(f"媒体时长必须大于零且不超过 {min(MAX_DURATION_MS, max_duration_ms) // 60000} 分钟。", "invalid_duration", 2)
         partial = Path(folder) / "complete.wav"
-        converted = subprocess.run(
+        converted = _process(
             [*arguments[:2], "-nostdin", "-loglevel", "error", "-xerror", "-y",
              *arguments[3:], "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-             "-c:a", "pcm_s16le", str(partial)], capture_output=True, timeout=300)
+             "-c:a", "pcm_s16le", str(partial)], control=control, timeout=300)
         if converted.returncode or not _valid_wav(partial):
             raise LocalImportError("音轨提取失败或媒体损坏；未修改原文件。", "invalid_media", 2)
         duration_ms = round(probe_audio(partial) * 1000)
@@ -198,11 +229,11 @@ def _segments(items: list[dict], duration_ms: int) -> list[dict]:
     return result
 
 
-def _transcribe(wav: Path, options: ImportOptions, progress: Callable[[str], None]):
+def _transcribe(wav: Path, options: ImportOptions, progress: Callable[[str], None], *, providers=None, control=None):
     if not options.allow_cloud_asr:
         raise LocalImportError("BLOCKED：云端 ASR 默认禁用；确认音频上传与可能费用后传 --allow-cloud-asr。",
                                "cloud_asr_not_authorized", 3)
-    key = _credentials("QWEN_OMNI_API_KEY", "DASHSCOPE_API_KEY")
+    key = _credentials("QWEN_OMNI_API_KEY", "DASHSCOPE_API_KEY", explicit=providers.asr_key if providers is not None else None)
     from app.core.config import Settings
     from app.services.omni_service import OmniService
     config = Settings(_env_file=None, deepseek_api_key="", dashscope_api_key="",
@@ -213,7 +244,7 @@ def _transcribe(wav: Path, options: ImportOptions, progress: Callable[[str], Non
                       audio_transcription_concurrency=options.concurrency,
                       audio_cache_dir=str(wav.parent), audio_boundary_review_enabled=False,
                       audio_boundary_batch_enabled=False)
-    service = OmniService(configuration=config)
+    service = OmniService(configuration=config, request_control=control) if control is not None else OmniService(configuration=config)
     try:
         return service.analyze_audio(wav, lambda done, total: progress(f"ASR {done}/{total} 段"))
     finally:
@@ -221,20 +252,28 @@ def _transcribe(wav: Path, options: ImportOptions, progress: Callable[[str], Non
             service._client.close()
 
 
-def _summary_chat(options: ImportOptions):
+def _summary_chat(options: ImportOptions, *, providers=None, control=None):
     if not options.allow_cloud_summary:
         raise LocalImportError("BLOCKED：云端总结默认禁用；确认文本上传与可能费用后传 --allow-cloud-summary。",
                                "cloud_summary_not_authorized", 3)
-    key = _credentials("DEEPSEEK_API_KEY")
+    key = _credentials("DEEPSEEK_API_KEY", explicit=providers.summary_key if providers is not None else None)
     from openai import OpenAI
     client = OpenAI(api_key=key, base_url=options.summary_base_url, max_retries=0, timeout=60)
     def chat(**kwargs):
         system = kwargs.pop("system_prompt")
         user = kwargs.pop("user_prompt")
-        response = client.chat.completions.create(
-            model=options.summary_model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            **kwargs)
+        request_index = control.before_request("deepseek", options.summary_model, options.summary_base_url) if control else None
+        try:
+            response = client.chat.completions.create(
+                model=options.summary_model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                **kwargs)
+        except Exception:
+            if control:
+                control.finish_request(request_index, "failed", error_code="provider_error")
+            raise
+        if control:
+            control.finish_request(request_index, "completed", request_id=getattr(response, "id", None), usage=getattr(response, "usage", None))
         if not response.choices or response.choices[0].finish_reason != "stop":
             raise LocalImportError("总结响应不完整，已保留逐字稿。", "incomplete_summary")
         return response.choices[0].message.content or ""
@@ -242,12 +281,20 @@ def _summary_chat(options: ImportOptions):
 
 
 def run_import(options: ImportOptions, *, progress: Callable[[str], None] = print,
-               asr=None, summary_chat=None) -> dict:
+               asr=None, summary_chat=None, control: ImportControl | None = None,
+               providers: ProviderConfig | None = None) -> dict:
     """Injected asr/chat are tests only and are unconditionally marked mock."""
     if options.mode not in {"subtitles", "qwen"} or options.summary not in {"none", "deepseek"}:
         raise LocalImportError("未知处理模式。", "invalid_mode", 2)
     if not 5 <= options.segment_seconds <= 120 or not 1 <= options.concurrency <= 4:
         raise LocalImportError("分段需为5–120秒，并发需为1–4。", "invalid_configuration", 2)
+    if type(options.max_duration_ms) is not int or options.max_duration_ms <= 0:
+        raise LocalImportError("无效的媒体时长上限。", "invalid_configuration", 2)
+    if control is not None:
+        original_progress = progress
+        def progress(message):
+            control.check()
+            original_progress(message)
     source = Path(options.input).expanduser().resolve()
     if source.suffix.lower() not in FORMATS:
         raise LocalImportError("支持的媒体类型为 MP4、MP3、M4A、WAV。", "unsupported_type", 2)
@@ -284,10 +331,10 @@ def run_import(options: ImportOptions, *, progress: Callable[[str], None] = prin
         raise LocalImportError("输入媒体/字幕不能位于该资产的输出目录内。", "input_output_overlap", 2)
     with _asset_lock(asset):
         return _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset,
-                           progress, asr, summary_chat)
+                           progress, asr, summary_chat, control, providers)
 
 
-def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, progress, asr, summary_chat):
+def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, progress, asr, summary_chat, control=None, providers=None):
     from app.services.media_service import _valid_wav
     from app.services.audio_media import probe_audio
     from app.services.local_markdown import (
@@ -332,7 +379,7 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
     trans_key = fingerprint(trans_config)
     manifest = {
         "schema_version": 1, "source_type": "local", "source_id": source_id, "source_sha256": source_hash,
-        "original_name": source.name, "title": options.title or source.stem,
+        "original_name": options.source_display_name or source.name, "title": options.title or source.stem,
         "size_bytes": source.stat().st_size, "duration_ms": previous.get("duration_ms"),
         "pipeline_version": PIPELINE_VERSION, "normalization_version": NORMALIZATION_VERSION,
         "created_at": previous.get("created_at", _now()), "updated_at": _now(),
@@ -348,7 +395,7 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
         "consent": {"cloud_asr": options.allow_cloud_asr, "cloud_summary": options.allow_cloud_summary},
     }
     if subtitle:
-        manifest["subtitles"] = {"original_name": subtitle.name, "sha256": subtitle_hash, "origin": "existing_subtitles"}
+        manifest["subtitles"] = {"original_name": options.subtitle_display_name or subtitle.name, "sha256": subtitle_hash, "origin": "existing_subtitles"}
     if previous.get("transcription_fingerprint") == trans_key:
         for name in ("summary_fingerprint", "summary_config"):
             if name in previous:
@@ -368,7 +415,10 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
             duration_ms = round(probe_audio(normalized) * 1000)
             progress("复用已校验的规范音频")
         else:
-            normalized, duration_ms = _normalize(source, cache)
+            normalized, duration_ms = (_normalize(source, cache) if control is None and options.max_duration_ms == MAX_DURATION_MS
+                                       else _normalize(source, cache, control=control, max_duration_ms=options.max_duration_ms))
+        if duration_ms > min(options.max_duration_ms, MAX_DURATION_MS):
+            raise LocalImportError(f"媒体超过本次 {min(options.max_duration_ms, MAX_DURATION_MS) // 60000} 分钟上限。", "invalid_duration", 2)
         if file_sha256(source) != source_hash:
             raise LocalImportError("处理期间原文件变化，停止导入。", "source_changed")
         manifest.update(duration_ms=duration_ms, normalized_sha256=file_sha256(normalized))
@@ -404,7 +454,10 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
                 if asr is not None:
                     result = asr(normalized, lambda done, total: progress(f"MOCK {done}/{total}"))
                 else:
-                    result = _transcribe(normalized, options, progress)
+                    result = (_transcribe(normalized, options, progress) if control is None and providers is None
+                              else _transcribe(normalized, options, progress, providers=providers, control=control))
+                if control is not None and not result.payload["transcript_segments"]:
+                    raise LocalImportError("未检测到可辨认语音；媒体已保留，可以播放核对。", "no_speech", 0)
                 segments = [{"start_ms": round(item["start_seconds"] * 1000),
                              "end_ms": round(item["end_seconds"] * 1000), "text": item["text"]}
                             for item in result.payload["transcript_segments"]]
@@ -446,7 +499,8 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
                 manifest["summary_reused"] = True
             else:
                 if summary_chat is None:
-                    summary_client, chat = _summary_chat(options)
+                    summary_client, chat = (_summary_chat(options) if control is None and providers is None
+                                            else _summary_chat(options, providers=providers, control=control))
                 else:
                     chat = summary_chat
                 progress("生成结构化知识笔记" if summary_chat is None else "TEST MOCK SUMMARY")
@@ -464,12 +518,24 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             status, code, message = "cancelled", "cancelled", "已取消；原文件未修改，已有转写与 checkpoint 保留。"
+        elif isinstance(exc, RuntimeControlError):
+            status = "cancelled" if exc.code == "cancelled" else "blocked"
+            code, message = exc.code, str(exc)
         elif isinstance(exc, LocalImportError):
-            status = "blocked" if exc.exit_code == 3 else "failed"
+            status = "no_speech" if exc.code == "no_speech" else ("blocked" if exc.exit_code == 3 else "failed")
             code, message = exc.code, str(exc)
         else:
             # SDK/ffmpeg exceptions can include secret keys or source text.
             status, code, message = "failed", "stage_failed", f"{stage} 阶段失败；已有逐字稿与 checkpoint 保留，请检查配置后重试。"
+            # Only the adapter's fixed error taxonomy is allowed into the UI.
+            safe_provider_codes = {"authentication_failed", "rate_limited", "provider_unavailable", "provider_timeout", "provider_error"}
+            if control is not None and getattr(exc, "code", None) in safe_provider_codes:
+                code = exc.code
+                message = {"authentication_failed": "服务认证失败，请核对密钥、地域与模型权限。",
+                           "rate_limited": "服务限流或配额不足，请检查账户后重试。",
+                           "provider_unavailable": "模型服务暂时不可用，已保留完成的片段。",
+                           "provider_timeout": "模型服务超时，已保留完成的片段。",
+                           "provider_error": "模型请求失败，请核对服务配置后重试。"}[code]
         manifest["stages"][stage] = status
         manifest.update(status=status, error={"code": code, "message": message})
         if transcript is not None:
@@ -481,8 +547,12 @@ def _run_locked(options, source, source_hash, subtitle, subtitle_hash, asset, pr
         save()
         if isinstance(exc, (KeyboardInterrupt, SystemExit, LocalImportError)):
             raise
+        if isinstance(exc, RuntimeControlError):
+            raise LocalImportError(message, code, 130 if code == "cancelled" else 3) from None
         raise LocalImportError(message, code) from None
     finally:
+        if control is not None:
+            manifest["cloud_requests"] = control.snapshot()
         if summary_client is not None:
             summary_client.close()
         try:

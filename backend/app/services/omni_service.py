@@ -125,9 +125,10 @@ warnings 只记录确实遇到的画面识别不确定性。
 
 
 class OmniService:
-    def __init__(self, configuration=None) -> None:
+    def __init__(self, configuration=None, request_control=None) -> None:
         self._settings = configuration if configuration is not None else settings
         self._custom_configuration = configuration is not None
+        self._request_control = request_control
         self._client: OpenAI | None = None
         self._client_lock = Lock()
         self._request_context = local()
@@ -144,7 +145,7 @@ class OmniService:
                     api_key=self._settings.qwen_omni_api_key or self._settings.dashscope_api_key,
                     base_url=self._settings.qwen_omni_base_url,
                     timeout=self._settings.qwen_omni_timeout,
-                    max_retries=1,
+                    max_retries=0 if self._request_control is not None else 1,
                 )
         return self._client
 
@@ -153,6 +154,10 @@ class OmniService:
             raise OmniServiceError("声音和画面片段过大，请缩短分段时长。")
         parts: list[str] = []
         finish = None
+        request_index = None
+        request_id = None
+        usage = None
+        request_error = None
         deadline = getattr(self._request_context, "boundary_deadline", None)
         try:
             client = self._get_client()
@@ -163,6 +168,8 @@ class OmniService:
                 # A request-scoped SDK clone shares the existing transport but
                 # does not mutate the root transcription client's retry policy.
                 client = client.with_options(timeout=min(self._settings.audio_boundary_review_timeout_seconds, remaining), max_retries=0)
+            if self._request_control is not None:
+                request_index = self._request_control.before_request("qwen", self._settings.qwen_omni_model, self._settings.qwen_omni_base_url)
             stream = client.chat.completions.create(
                 model=self._settings.qwen_omni_model,
                 messages=[{"role": "user", "content": content}],
@@ -172,6 +179,8 @@ class OmniService:
             )
             try:
                 for chunk in stream:
+                    request_id = getattr(chunk, "id", None) or request_id
+                    usage = getattr(chunk, "usage", None) or usage
                     if deadline is not None and time.monotonic() >= deadline:
                         raise OmniServiceError("补听读取超时，保留原文字稿。", code="boundary_review_timeout", raw_response="".join(parts) or None)
                     if chunk.choices:
@@ -184,11 +193,23 @@ class OmniService:
                 stream.close()
         except _TRANSPORT_ERRORS as error:
             status = getattr(error, "status_code", None)
+            request_id = getattr(error, "request_id", None) or request_id
+            request_error = ("provider_timeout" if isinstance(error, _REQUEST_TIMEOUTS) else
+                             "authentication_failed" if status in {401, 403} else
+                             "rate_limited" if status == 429 else
+                             "provider_unavailable" if status and status >= 500 else "provider_error")
             label = f"（状态 {status}）" if status else ""
             raise OmniServiceError(f"千问声音与画面识别调用失败{label}，请检查服务区域、模型权限和账户余额。",
                                    code=("boundary_review_timeout" if deadline is not None
-                                         and isinstance(error, _REQUEST_TIMEOUTS) else "api_error"),
+                                         and isinstance(error, _REQUEST_TIMEOUTS) else
+                                         request_error if self._request_control is not None else "api_error"),
                                    raw_response="".join(parts) or None) from None
+        finally:
+            if request_index is not None:
+                self._request_control.finish_request(
+                    request_index, "completed" if finish == "stop" and request_error is None else "failed",
+                    request_id=request_id, usage=usage,
+                    error_code=request_error or ("output_incomplete" if finish != "stop" else None))
         if finish != "stop":
             raise OmniServiceError("模型未完整返回结果，未将片段作为成功结果保存，请重试或缩短分段。",
                                    code="output_incomplete", raw_response="".join(parts))
@@ -319,6 +340,8 @@ class OmniService:
         })
 
         def recognize(segment):
+            if self._request_control is not None:
+                self._request_control.check()
             # Each root owns its retry budget and counters; only the checkpoint
             # is shared across threads. The coordinator updates progress.
             attempts = failures = reused_children = 0
@@ -374,6 +397,8 @@ class OmniService:
                 def fill_available_slots():
                     nonlocal issued, covered_until, exhausted
                     while not exhausted and len(pending) < concurrency:
+                        if self._request_control is not None:
+                            self._request_control.check()
                         try:
                             segment = next(iterator)
                         except StopIteration:
