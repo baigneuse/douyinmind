@@ -1,5 +1,9 @@
-"""Network source collection and explicit public downloads; no ASR pipeline."""
-from typing import Annotated
+"""Network source collection and explicit public downloads; no ASR pipeline.
+
+TikHub routes expose connection state, previews and imports. The API token is
+read by the backend only and is never part of a request or response here.
+"""
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
@@ -27,9 +31,84 @@ class SourcePatch(BaseModel):
     archived: bool | None = None
 
 
+class DownloadInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm_paid: bool = False
+    force: bool = False
+    method: Literal["auto", "tikhub", "anonymous"] = "auto"
+
+
+class TikHubCheckInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["demo", "account"] = "demo"
+
+
+class TikHubLinkInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=2000)
+    confirm_paid: bool = False
+
+
+class TikHubCreatorInput(TikHubLinkInput):
+    cursor: int = Field(default=0, ge=0, le=10**15)
+
+
+class TikHubImportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    preview_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    item_ids: list[Annotated[str, Field(pattern=r"^\d{6,25}$")]] = Field(min_length=1, max_length=20)
+
+
+def tikhub():
+    service = get_network_library().tikhub
+    if service is None:
+        raise WorkspaceError("tikhub_unavailable", "当前后端没有启用 TikHub 数据源。", 404)
+    return service
+
+
 @router.get("/capabilities")
 def capabilities():
     return get_network_library().capabilities()
+
+
+@router.get("/tikhub/status")
+def tikhub_status():
+    try:
+        return tikhub().status()
+    except WorkspaceError as error:
+        failure(error)
+
+
+@router.post("/tikhub/check")
+def tikhub_check(data: TikHubCheckInput):
+    try:
+        return tikhub().check(data.mode)
+    except WorkspaceError as error:
+        failure(error)
+
+
+@router.post("/tikhub/resolve")
+def tikhub_resolve(data: TikHubLinkInput):
+    try:
+        return tikhub().resolve(data.text, data.confirm_paid)
+    except WorkspaceError as error:
+        failure(error)
+
+
+@router.post("/tikhub/creator")
+def tikhub_creator(data: TikHubCreatorInput):
+    try:
+        return tikhub().creator(data.text, data.cursor, data.confirm_paid)
+    except WorkspaceError as error:
+        failure(error)
+
+
+@router.post("/tikhub/import", status_code=201)
+def tikhub_import(data: TikHubImportInput):
+    try:
+        return tikhub().import_items(data.preview_id, data.item_ids)
+    except WorkspaceError as error:
+        failure(error)
 
 
 @router.post("/sources", status_code=201)
@@ -66,9 +145,10 @@ def patch(source_id: str, data: SourcePatch):
 
 
 @router.post("/sources/{source_id}/download", status_code=202)
-def download(source_id: str):
+def download(source_id: str, data: DownloadInput | None = None):
     try:
-        return get_network_library().download(source_id)
+        options = data.model_dump() if data is not None else {}
+        return get_network_library().download(source_id, **options)
     except WorkspaceError as error:
         failure(error)
 

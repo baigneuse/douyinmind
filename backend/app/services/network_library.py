@@ -2,6 +2,10 @@
 
 This library never reads login cookies or provider credentials. A successful
 download is published separately from its attempt so a retry cannot erase media.
+
+An optional data provider (``self.tikhub``) may resolve public Douyin posts. It
+keeps its own token in memory; the library only stores the platform post id it
+reports, which is also the key that merges short and long links of one post.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ class NetworkLibrary:
         self._worker = worker
         self._lock = RLock()
         self._cancel: dict[str, Event] = {}
+        self.tikhub = None  # Optional TikHubService; absent means anonymous downloads only.
         self.path().mkdir(exist_ok=True)
         for category in ("sources", "media", "attempts"):
             self.path(category).mkdir(exist_ok=True)
@@ -68,7 +73,7 @@ class NetworkLibrary:
 
     @staticmethod
     def public(source: dict) -> dict:
-        value = {key: value for key, value in source.items() if key not in {"media", "title_custom"}}
+        value = {key: value for key, value in source.items() if key not in {"media", "title_custom", "aliases"}}
         value["media_version"] = source.get("media", {}).get("sha256")
         return deepcopy(value)
 
@@ -87,27 +92,172 @@ class NetworkLibrary:
             raise WorkspaceError(error.code, str(error)) from None
         if not 1 <= len(parsed) <= 20:
             raise WorkspaceError("invalid_batch", "一次请保存 1–20 个有效链接。")
+        from app.services.tikhub_adapter import offline_item_id
         with self._lock:
             items, created, duplicates = [], 0, 0
+            by_item, by_alias = self._item_index()
             for entry in parsed:
                 canonical = entry["canonical_url"]
-                source_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-                path = self.path("sources", source_id + ".json")
-                if path.is_file():
-                    source = self.source(source_id)
+                # A long link names its post; an earlier short or long link of the same post is reused.
+                item_id = offline_item_id(entry["url"]) if entry["platform"] == "douyin" else None
+                source = by_alias.get(canonical) or (by_item.get((entry["platform"], item_id)) if item_id else None)
+                if source is not None:
                     duplicates += 1
                 else:
-                    source = {"id": source_id, "url": entry["url"], "canonical_url": canonical,
-                              "platform": entry["platform"], "supported": bool(entry["supported"]),
-                              "title": entry.get("title") or canonical, "author": "", "tags": [], "note": "",
-                              "starred": False, "archived": False, "revision": 0, "status": "saved", "progress": None,
-                              "error": None, "has_media": False, "download_id": None,
-                              "filename": None, "size_bytes": None, "duration_ms": None, "content_type": None,
-                              "created_at": now(), "updated_at": now()}
+                    source = self._new_source(entry["url"], canonical, entry["platform"], bool(entry["supported"]),
+                                              entry.get("title") or canonical, item_id=item_id)
                     self._save_source(source)
+                    by_alias[canonical] = source
+                    if item_id:
+                        by_item[(entry["platform"], item_id)] = source
                     created += 1
                 items.append(self.public(source))
             return {"items": items, "created": created, "duplicates": duplicates}
+
+    @staticmethod
+    def _new_source(url: str, canonical: str, platform: str, supported: bool, title: str, *,
+                    item_id: str | None = None, provider: str | None = None) -> dict:
+        return {"id": hashlib.sha256(canonical.encode("utf-8")).hexdigest(), "url": url, "canonical_url": canonical,
+                "platform": platform, "supported": supported, "title": title, "author": "", "tags": [], "note": "",
+                "starred": False, "archived": False, "revision": 0, "status": "saved", "progress": None,
+                "error": None, "has_media": False, "download_id": None,
+                "filename": None, "size_bytes": None, "duration_ms": None, "content_type": None,
+                "provider": provider, "platform_item_id": item_id,
+                "created_at": now(), "updated_at": now()}
+
+    def _item_index(self) -> tuple[dict[tuple[str, str], dict], dict[str, dict]]:
+        """Lookups by (platform, post id) and by saved link; the caller holds the lock.
+
+        When older records share a post, the one with media and then the oldest wins.
+        """
+        from app.services.tikhub_adapter import offline_item_id
+        records = []
+        for path in self.path("sources").glob("*.json"):
+            try:
+                records.append(self.source(path.stem))
+            except WorkspaceError:
+                continue  # An unreadable record must not block saving other sources.
+        by_item: dict[tuple[str, str], dict] = {}
+        by_alias: dict[str, dict] = {}
+        for source in sorted(records, key=lambda value: (not value.get("has_media"), value.get("created_at", ""))):
+            item_id = source.get("platform_item_id")
+            if not item_id and source["platform"] == "douyin":
+                item_id = offline_item_id(source["canonical_url"])
+            if item_id:
+                by_item.setdefault((source["platform"], item_id), source)
+            for alias in (source["canonical_url"], *source.get("aliases", [])):
+                by_alias.setdefault(alias, source)
+        return by_item, by_alias
+
+    def find_item(self, platform: str, *, item_id: str | None = None, alias: str | None = None) -> dict | None:
+        """The saved source for a platform post id or a previously seen link, without network access."""
+        with self._lock:
+            by_item, by_alias = self._item_index()
+            found = by_item.get((platform, item_id)) if item_id else None
+            if found is None and alias:
+                found = by_alias.get(alias)
+            return deepcopy(found) if found is not None else None
+
+    @staticmethod
+    def _apply_provider(source: dict, entry: dict) -> None:
+        """Merge provider facts into a record; user edits, notes and media are untouched."""
+        source["platform_item_id"] = source.get("platform_item_id") or entry["item_id"]
+        source["provider"] = entry["provider"]
+        aliases = source.setdefault("aliases", [])
+        for alias in (entry.get("alias"), entry["canonical_url"]):
+            if alias and alias != source["canonical_url"] and alias not in aliases and len(aliases) < 20:
+                aliases.append(alias)
+        title = str(entry.get("title") or "")[:256]
+        if title and not source.get("title_custom") and source["title"] != title:
+            source["title"] = title
+            source["revision"] += 1
+        if not source.get("author") and entry.get("author"):
+            source["author"] = str(entry["author"])[:256]
+        if source.get("duration_ms") is None and type(entry.get("duration_ms")) is int:
+            source["duration_ms"] = entry["duration_ms"]
+
+    def import_provider_items(self, entries: list[dict]) -> dict:
+        """Add provider-resolved posts, deduplicated by platform post id.
+
+        A link saved earlier, short or long, is upgraded in place so its notes,
+        tags and media are kept. Nothing here touches the network.
+        """
+        if not 1 <= len(entries) <= 20:
+            raise WorkspaceError("invalid_batch", "一次请加入 1–20 个作品。")
+        with self._lock:
+            items, created, duplicates = [], 0, 0
+            by_item, by_alias = self._item_index()
+            for entry in entries:
+                key = (entry["platform"], entry["item_id"])
+                source = (by_item.get(key) or by_alias.get(entry["canonical_url"])
+                          or (by_alias.get(entry["alias"]) if entry.get("alias") else None))
+                if source is not None:
+                    source = self.source(source["id"])
+                    duplicates += 1
+                else:
+                    source = self._new_source(entry["url"], entry["canonical_url"], entry["platform"],
+                                              bool(entry["supported"]), entry["title"],
+                                              item_id=entry["item_id"], provider=entry["provider"])
+                    created += 1
+                self._apply_provider(source, entry)
+                self._save_source(source)
+                by_item[key] = source
+                for alias in (source["canonical_url"], *source.get("aliases", [])):
+                    by_alias[alias] = source
+                items.append(self.public(source))
+            return {"items": items, "created": created, "duplicates": duplicates}
+
+    def attach_provider_item(self, source_id: str, info: dict) -> None:
+        """Record the post id learned while downloading; refuse a second copy of a downloaded post."""
+        entry = {"item_id": info["item_id"], "canonical_url": info["canonical_url"], "provider": "tikhub",
+                 "title": info.get("title"), "author": info.get("author"), "duration_ms": info.get("duration_ms")}
+        with self._lock:
+            source = self.source(source_id)
+            other = self._item_index()[0].get((source["platform"], info["item_id"]))
+            if other is not None and other["id"] != source_id:
+                primary = self.source(other["id"])
+                # Remember this link on the first record so the next paste is answered offline.
+                self._apply_provider(primary, {**entry, "provider": primary.get("provider") or "tikhub",
+                                               "alias": source["canonical_url"], "title": None})
+                self._save_source(primary)
+                if primary.get("has_media"):
+                    raise WorkspaceError("duplicate_item", "资料库中已有这个作品的本地副本；没有重复下载。", 409)
+            self._apply_provider(source, entry)
+            self._save_source(source)
+
+    def download_statistics(self, platform: str = "douyin") -> dict:
+        """Outcome counts per download method, for comparing the provider with anonymous extraction."""
+        outcomes = ("ready", "needs_login", "unsupported", "failed")
+        methods = {name: {"attempts": 0, **{key: 0 for key in outcomes}, "other": 0} for name in ("tikhub", "anonymous")}
+        with self._lock:
+            sources, latest = {}, {}
+            for path in self.path("sources").glob("*.json"):
+                try:
+                    source = self.source(path.stem)
+                except WorkspaceError:
+                    continue
+                if source["platform"] == platform:
+                    sources[source["id"]] = source
+            for path in self.path("attempts").glob("*/attempt.json"):
+                try:
+                    attempt = self._attempt(path.parent.name)
+                except WorkspaceError:
+                    continue
+                if attempt.get("source_id") not in sources:
+                    continue
+                method = "tikhub" if attempt.get("method") == "tikhub" else "anonymous"
+                latest[attempt["id"]] = method
+                bucket = methods[method]
+                bucket["attempts"] += 1
+                bucket[attempt["status"] if attempt.get("status") in outcomes else "other"] += 1
+            resolved = [source for source in sources.values() if source.get("provider") == "tikhub"]
+            return {"platform": platform, "methods": methods,
+                    "sources": {"resolved": len(resolved),
+                                "downloaded": sum(bool(source.get("has_media")) for source in resolved),
+                                # The provider answered, but the post needs a login or permission.
+                                "needs_permission": sum(source["status"] == "needs_login"
+                                                        and latest.get(source.get("download_id")) == "tikhub"
+                                                        for source in sources.values())}}
 
     def list_sources(self) -> list[dict]:
         with self._lock:
@@ -151,15 +301,36 @@ class NetworkLibrary:
                     attempt.update(status="interrupted", error={"code": "interrupted", "message": "服务重启，未自动重新下载。"})
                     self._save_attempt(attempt)
 
-    def download(self, source_id: str) -> dict:
+    def _plan(self, source: dict, *, confirm_paid: bool, force: bool, method: str) -> dict:
+        """Choose the download path before queueing; paid provider requests need confirmation here."""
+        provider = self.tikhub
+        eligible = provider is not None and source["platform"] == "douyin" and bool(source.get("supported"))
+        if method != "anonymous" and eligible:
+            paid = provider.download_cost(source)
+            if method == "tikhub" or provider.configured or not paid:
+                intact = False
+                if source.get("has_media") and source.get("media"):
+                    stored = self.path("media", source["id"], source["media"]["filename"])
+                    intact = stored.is_file() and stored.stat().st_size == source["size_bytes"]
+                if intact and not force:
+                    raise WorkspaceError("already_downloaded", "此作品已成功下载到本机；没有重复请求。", 409)
+                provider.authorize(paid, confirm_paid)
+                return {"method": "tikhub", "paid": paid}
+        elif method == "tikhub":
+            raise WorkspaceError("tikhub_not_available", "此来源不能通过 TikHub 下载。", 409)
+        return {"method": "anonymous", "paid": 0}
+
+    def download(self, source_id: str, *, confirm_paid: bool = False, force: bool = False, method: str = "auto") -> dict:
         with self._lock:
             source = self.source(source_id)
             if source["status"] in ACTIVE:
                 raise WorkspaceError("download_busy", "此来源已有下载任务。", 409)
+            plan = self._plan(source, confirm_paid=confirm_paid, force=force, method=method)
             attempt_id = uuid4().hex
             self.path("attempts", attempt_id).mkdir(exist_ok=False)
             attempt = {"id": attempt_id, "source_id": source_id, "status": "queued", "progress": None,
-                       "error": None, "created_at": now(), "updated_at": now()}
+                       "error": None, "method": plan["method"], "paid_requests_allowed": plan["paid"],
+                       "tikhub_requests": 0, "created_at": now(), "updated_at": now()}
             self._save_attempt(attempt)
             source.update(status="queued", progress=None, error=None, download_id=attempt_id)
             self._save_source(source)
@@ -223,8 +394,17 @@ class NetworkLibrary:
         try:
             target = self.path("attempts", attempt_id, "download")
             target.mkdir(exist_ok=False)
+            extra = {}
+            if attempt.get("method") == "tikhub":
+                # The provider resolves addresses in this process; the isolated
+                # downloader receives public media URLs only, never the token.
+                extra["media"], used = self.tikhub.media_for(source, paid_allowed=bool(attempt.get("paid_requests_allowed")))
+                with self._lock:
+                    attempt = self._attempt(attempt_id)
+                    attempt["tikhub_requests"] = used
+                    self._save_attempt(attempt)
             result = download_media(source["canonical_url"], target,
-                                    progress=lambda value: self._progress(attempt_id, value), cancelled=event.is_set)
+                                    progress=lambda value: self._progress(attempt_id, value), cancelled=event.is_set, **extra)
             self._publish(attempt_id, result)
         except Exception as error:
             known = isinstance(error, (NetworkDownloadError, WorkspaceError))
@@ -232,11 +412,15 @@ class NetworkLibrary:
             message = str(error) if known else "下载未完成；来源和已有媒体保留，请稍后重试。"
             status = "cancelled" if event.is_set() or code == "cancelled" else {
                 "needs_login": "needs_login", "authentication_required": "needs_login",
+                "private_content": "needs_login", "restricted_content": "needs_login",
                 "unsupported": "unsupported", "unsupported_source": "unsupported",
+                "image_post": "unsupported", "no_playable_media": "unsupported",
             }.get(code, "failed")
             with self._lock:
                 attempt = self._attempt(attempt_id)
                 source = self.source(attempt["source_id"])
+                if type(getattr(error, "tikhub_requests", None)) is int:
+                    attempt["tikhub_requests"] = error.tikhub_requests
                 attempt.update(status=status, error={"code": code, "message": message})
                 self._save_attempt(attempt)
                 if source["download_id"] == attempt_id:
@@ -319,5 +503,8 @@ def get_network_library() -> NetworkLibrary:
     global _library
     with _library_lock:
         if _library is None:
-            _library = NetworkLibrary()
+            from app.services.tikhub_service import TikHubService
+            library = NetworkLibrary()
+            library.tikhub = TikHubService(library)
+            _library = library
         return _library

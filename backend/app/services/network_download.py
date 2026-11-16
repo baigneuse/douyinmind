@@ -2,6 +2,8 @@
 
 Source collection is deliberately offline. The worker owns network access and
 never imports application settings, browser profiles or provider credentials.
+A data provider may hand over already resolved public media addresses; the
+worker then skips extraction but applies every other transport and media check.
 """
 from __future__ import annotations
 
@@ -27,6 +29,8 @@ MAX_BYTES = 500 * 1024 * 1024
 MAX_DURATION_MS = 2 * 60 * 60 * 1000
 MAX_SECONDS = 15 * 60
 MAX_SOURCES = 20
+MAX_PROVIDED_MEDIA = 6
+_WORKER_INPUT_BYTES = 16384
 _MEDIA_EXTENSIONS = {'.mp4', '.webm', '.mov', '.m4v'}
 _TRACKING = {'si', 'spm_id_from', 'vd_source', 'share_source', 'share_medium',
              'share_plat', 'share_session_id', 'share_tag', 'timestamp', 'feature',
@@ -252,10 +256,27 @@ class _ProcessTree:
             self.process.kill()
 
 
-def download_media(url: str, target_dir: Path, *, progress: Callable[[dict], None], cancelled: Callable[[], bool]) -> dict:
+def _provided_media(media: dict) -> dict:
+    """Validate provider-resolved addresses before they reach the worker."""
+    candidates = media.get('candidates') if isinstance(media, dict) else None
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= MAX_PROVIDED_MEDIA:
+        raise NetworkDownloadError('unsupported_source')
+    urls = []
+    for candidate in candidates:
+        url = candidate.get('url') if isinstance(candidate, dict) else None
+        _validate_url(url)
+        urls.append(url)
+    return {'candidates': [{'url': url} for url in urls],
+            'title': _safe_text(media.get('title'), ''), 'author': _safe_text(media.get('author'), '')}
+
+
+def download_media(url: str, target_dir: Path, *, progress: Callable[[dict], None], cancelled: Callable[[], bool],
+                   media: dict | None = None) -> dict:
     source = _source(url)
     if not source['supported']:
         raise NetworkDownloadError('unsupported_source')
+    if media is not None:
+        media = _provided_media(media)
     if cancelled():
         raise NetworkDownloadError('cancelled')
     target = Path(target_dir).resolve()
@@ -263,8 +284,15 @@ def download_media(url: str, target_dir: Path, *, progress: Callable[[dict], Non
     if any(target.iterdir()):
         raise NetworkDownloadError('target_not_empty')
     probe, merge = _media_tool('ffprobe'), _media_tool('ffmpeg')
-    if not merge or importlib.util.find_spec('yt_dlp') is None:
+    if not merge or (media is None and importlib.util.find_spec('yt_dlp') is None):
         raise NetworkDownloadError('tool_unavailable')
+    request = {'url': source['canonical_url'], 'target': str(target), 'ffprobe': probe, 'ffmpeg': merge,
+               'deno': None if media is not None else _deno_tool()}
+    if media is not None:
+        request['media'] = media
+    payload = json.dumps(request).encode('utf-8') + b'\n'
+    if len(payload) > _WORKER_INPUT_BYTES:
+        raise NetworkDownloadError('invalid_source')
     worker = Path(__file__).with_name('network_download_worker.py')
     process = subprocess.Popen([sys.executable, '-I', '-B', str(worker)], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=target,
@@ -293,8 +321,7 @@ def download_media(url: str, target_dir: Path, *, progress: Callable[[dict], Non
     try:
         tree = _ProcessTree(process)
         threading.Thread(target=read_events, daemon=True).start()
-        process.stdin.write(json.dumps({'url': source['canonical_url'], 'target': str(target),
-                                        'ffprobe': probe, 'ffmpeg': merge, 'deno': _deno_tool()}).encode('utf-8') + b'\n')
+        process.stdin.write(payload)
         process.stdin.close()
         started = time.monotonic()
         while True:

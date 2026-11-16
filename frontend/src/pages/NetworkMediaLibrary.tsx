@@ -1,7 +1,8 @@
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react';
 import { Archive, ArrowDownToLine, ArrowUpRight, Check, ChevronRight, CircleHelp, Download, FileVideo, FolderOpen, Layers, Link, LoaderCircle, Plus, RefreshCw, Save, Search, Star, Video, X } from 'lucide-react';
-import { DOWNLOAD_LABELS, PLATFORM_LABELS, NetworkMediaError, downloadActive, downloadFileUrl, filterSources, hasDownloadRecord, inspectSourcePatch, networkErrorMessage, networkMediaApi as api, networkMediaUrl, parseTags, safeSourceUrl, sizeLabel } from '../networkMediaApi';
-import type { LibraryView, NetworkCapabilities, NetworkSource, SourcePatch } from '../networkMediaApi';
+import { DOWNLOAD_LABELS, PLATFORM_LABELS, NetworkMediaError, TIKHUB_STATE_LABELS, costLabel, downloadActive, downloadFileUrl, filterSources, hasDownloadRecord, inspectSourcePatch, networkErrorMessage, networkMediaApi as api, networkMediaUrl, parseTags, safeSourceUrl, sizeLabel, tikhubState, usesTikHub } from '../networkMediaApi';
+import type { DownloadOptions, LibraryView, NetworkCapabilities, NetworkSource, SourcePatch, TikHubStatus } from '../networkMediaApi';
+import TikHubPanel from './TikHubPanel';
 import './networkMedia.css';
 
 interface Props { active: boolean; onOpenLocal: () => void; onOpenDouyin: () => void; }
@@ -36,16 +37,19 @@ function DownloadState({ source, compact = false }: { source: NetworkSource; com
       {percent != null && <progress value={progress.downloaded_bytes} max={total!} aria-label="视频下载进度" />}
       <p>{sizeLabel(progress.downloaded_bytes)}{total ? ` / ${sizeLabel(total)}` : ' · 文件总大小暂未知'}</p>
     </div>}
+    {compact && source.error && ['failed', 'needs_login', 'unsupported'].includes(source.status) && <span className="nv-card-error">{source.error.message}</span>}
   </div>;
 }
 
-function SourceDetail({ source, draft, capability, busy, onEdit, onSave, onToggleStar, onArchive, onDownload, onCancel }: {
-  source: NetworkSource; draft: EditDraft | undefined; capability: NetworkCapabilities | null; busy: boolean;
+function SourceDetail({ source, draft, capability, tikhub, paidPrompt, busy, onEdit, onSave, onToggleStar, onArchive, onDownload, onCancelPaid, onCancel }: {
+  source: NetworkSource; draft: EditDraft | undefined; capability: NetworkCapabilities | null; tikhub: TikHubStatus | null; paidPrompt: boolean; busy: boolean;
   onEdit: (patch: Partial<EditDraft>) => void; onSave: (revision?: number) => void; onToggleStar: () => void;
-  onArchive: () => void; onDownload: () => void; onCancel: () => void;
+  onArchive: () => void; onDownload: (options?: DownloadOptions) => void; onCancelPaid: () => void; onCancel: () => void;
 }) {
   const [playbackError, setPlaybackError] = useState(false);
   const active = downloadActive(source);
+  const viaTikHub = usesTikHub(source, tikhub);
+  const retrying = ['failed', 'needs_login', 'unsupported', 'cancelled', 'interrupted'].includes(source.status);
   const origin = safeSourceUrl(source.url);
   const dirty = draft ? draftKey(draft) !== draft.baseline : false;
   const changedElsewhere = Boolean(draft && dirty && metadataKey(source) !== draft.baseline);
@@ -63,8 +67,13 @@ function SourceDetail({ source, draft, capability, busy, onEdit, onSave, onToggl
       <div className="nv-media-caption"><span><Check size={12} />已有本地副本{source.size_bytes != null ? ` · ${sizeLabel(source.size_bytes)}` : ''}</span><a href={downloadFileUrl(source.id)} download><ArrowDownToLine size={13} />下载原件</a></div>
     </div> : <div className="nv-no-media"><FileVideo size={30} /><strong>链接已保存</strong><p>需要离线观看时，再下载到这台电脑。</p>{origin && <a href={origin} target="_blank" rel="noopener noreferrer">在原站观看<ArrowUpRight size={13} /></a>}</div>}
 
-    <div className="nv-download-box"><div className="nv-download-row"><DownloadState source={source} />{active ? <button type="button" className="nv-button" disabled={busy || source.status === 'cancel_requested'} onClick={onCancel}><X size={14} />取消下载</button> : <button type="button" className="nv-button" disabled={busy || !capability?.downloader_ready} onClick={onDownload}><Download size={14} />{source.has_media ? '重新下载' : ['failed', 'needs_login', 'unsupported', 'cancelled', 'interrupted'].includes(source.status) ? '手动重试下载' : '下载到本机'}</button>}</div>
+    <div className="nv-download-box"><div className="nv-download-row"><DownloadState source={source} />{active ? <button type="button" className="nv-button" disabled={busy || source.status === 'cancel_requested'} onClick={onCancel}><X size={14} />取消下载</button>
+      : viaTikHub ? (source.has_media ? null : <button type="button" className="nv-button" disabled={busy || !capability?.ffmpeg_available} onClick={() => onDownload()}><Download size={14} />{retrying ? '通过 TikHub 重试' : '通过 TikHub 下载'}</button>)
+        : <button type="button" className="nv-button" disabled={busy || !capability?.downloader_ready} onClick={() => onDownload()}><Download size={14} />{source.has_media ? '重新下载' : retrying ? '手动重试下载' : '下载到本机'}</button>}</div>
+      {paidPrompt && tikhub && <div className="nv-tk-confirm" role="alertdialog" aria-labelledby="download-confirm-title"><p id="download-confirm-title"><strong>确认发送付费请求</strong>下载地址需要向 TikHub 请求 1 次，按公开单价预估 {costLabel(1, tikhub.prices.per_paid_request_usd)}，实际以 TikHub 账单为准。</p><div><button type="button" className="nv-button nv-primary" disabled={busy} onClick={() => onDownload({ confirm_paid: true })}><Check size={13} />确认并下载</button><button type="button" className="nv-button" disabled={busy} onClick={onCancelPaid}>取消</button></div></div>}
       {source.error && <p className="nv-download-error">{source.error.message}</p>}
+      {viaTikHub && source.has_media && <p className="nv-small">已有本地副本；不会为同一作品重复请求 TikHub 或重复下载。</p>}
+      {viaTikHub && !source.has_media && !active && <p className="nv-small">抖音作品通过 TikHub 取得公开下载地址。<button type="button" className="nv-link-button" disabled={busy || !capability?.downloader_ready} onClick={() => onDownload({ method: 'anonymous' })}>改用原匿名方式尝试（免费，常被要求登录）</button></p>}
       {source.status === 'needs_login' && <p className="nv-small">需要到原站完成登录或验证。本工具不会索取账号、读取浏览器 Cookie 或绕过访问限制。</p>}
       {source.status === 'interrupted' && <p className="nv-small">上次下载因后台停止而中断。系统不会自动重试，请按需手动继续。</p>}
       {source.has_media && source.status !== 'ready' && <p className="nv-small">这里保留上次成功保存的副本，新一次下载状态单独显示。</p>}
@@ -87,6 +96,8 @@ function SourceDetail({ source, draft, capability, busy, onEdit, onSave, onToggl
 
 export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin }: Props) {
   const [capability, setCapability] = useState<NetworkCapabilities | null>(null);
+  const [tikhub, setTikhub] = useState<TikHubStatus | null>(null);
+  const [paidPrompt, setPaidPrompt] = useState<string | null>(null);
   const [sources, setSources] = useState<NetworkSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [connectionError, setConnectionError] = useState('');
@@ -131,6 +142,9 @@ export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin 
     const controller = new AbortController();
     void api.capabilities(controller.signal).then(value => { if (!controller.signal.aborted) { setCapability(value); setCapabilityError(''); } })
       .catch(error => { if (!controller.signal.aborted) { setCapability(null); setCapabilityError(networkErrorMessage(error)); } });
+    // Local state only: reading the status never contacts TikHub.
+    void api.tikhubStatus(controller.signal).then(value => { if (!controller.signal.aborted) setTikhub(value); })
+      .catch(() => { if (!controller.signal.aborted) setTikhub(null); });
     return () => controller.abort();
   }, [active, refreshKey]);
   useEffect(() => {
@@ -183,11 +197,27 @@ export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin 
     } catch (error) { setActionError(networkErrorMessage(error)); }
     finally { collectLock.current = false; setCollecting(false); }
   };
-  const act = async (source: NetworkSource, action: 'star' | 'archive' | 'download' | 'cancel') => {
+  const imported = async (result: { items: NetworkSource[]; created: number; duplicates: number }, download: boolean) => {
+    mutationEpoch.current++;
+    setSources(previous => { const items = new Map(previous.map(source => [source.id, source])); result.items.forEach(source => items.set(source.id, source)); return [...items.values()].sort((a, b) => b.created_at.localeCompare(a.created_at)); });
+    setDrafts(previous => { const next = { ...previous }; result.items.forEach(source => { if (!next[source.id]) next[source.id] = sourceDraft(source); }); return next; });
+    let queued = 0, waiting = 0;
+    if (download) for (const source of result.items) {
+      if (source.has_media || source.supported === false || downloadActive(source)) continue;
+      // Addresses from the preview are still in memory, so this sends no paid request.
+      try { putSource(await api.download(source.id)); queued++; } catch { waiting++; }
+    }
+    setNotice(`已加入 ${result.created} 条${result.duplicates ? `，${result.duplicates} 条已在资料库（未重复保存）` : ''}。${download ? `${queued} 条已排队下载${waiting ? `，${waiting} 条未能开始，请在详情中查看` : ''}。` : '没有发起下载。'}`);
+    const first = result.items[0];
+    if (first) { setSelectedId(first.id); setView(first.archived ? 'archived' : 'all'); setPlatform('all'); setSearch(''); }
+    refresh();
+  };
+  const act = async (source: NetworkSource, action: 'star' | 'archive' | 'download' | 'cancel', options: DownloadOptions = {}) => {
     if (actionLocks.current.has(source.id)) return;
     actionLocks.current.add(source.id); setActing(new Set(actionLocks.current)); setActionError('');
+    if (action === 'download') setPaidPrompt(null);
     try {
-      const value = action === 'download' ? await api.download(source.id) : action === 'cancel' ? await api.cancel(source.id)
+      const value = action === 'download' ? await api.download(source.id, options) : action === 'cancel' ? await api.cancel(source.id)
         : await api.update(source.id, action === 'star' ? { starred: !source.starred, expected_revision: source.revision } : { archived: !source.archived, expected_revision: source.revision });
       mutationEpoch.current++;
       putSource(value);
@@ -197,7 +227,11 @@ export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin 
       });
       if (action === 'archive') { setNotice(value.archived ? '已归档，可在“已归档”中恢复。' : '已恢复到资料库。'); setView(value.archived ? 'archived' : 'all'); }
       refresh();
-    } catch (error) { setActionError(networkErrorMessage(error)); }
+    } catch (error) {
+      // A paid TikHub request is never sent implicitly: ask for this one download first.
+      if (action === 'download' && error instanceof NetworkMediaError && error.code === 'tikhub_confirmation_required' && !options.confirm_paid) setPaidPrompt(source.id);
+      else setActionError(networkErrorMessage(error));
+    }
     finally { actionLocks.current.delete(source.id); setActing(new Set(actionLocks.current)); }
   };
   const save = async (source: NetworkSource, revision?: number) => {
@@ -224,7 +258,7 @@ export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin 
   const openCollector = () => { setCollectorOpen(true); setTimeout(() => textarea.current?.focus(), 0); };
 
   return <div className="nv-root">
-    <header className="nv-header"><div className="nv-brand"><span><Video size={21} /></span><div><strong>DouyinMind</strong><p>视频资料库</p></div></div><div className="nv-header-right"><span className="nv-local-badge"><span />资料保存在本机</span><button type="button" className="nv-button" onClick={refresh}><RefreshCw size={14} />重新连接</button></div></header>
+    <header className="nv-header"><div className="nv-brand"><span><Video size={21} /></span><div><strong>DouyinMind</strong><p>视频资料库</p></div></div><div className="nv-header-right">{tikhub?.available && <span className={`nv-local-badge nv-tk-badge nv-tk-${tikhubState(tikhub)}`}><span />{TIKHUB_STATE_LABELS[tikhubState(tikhub)]}</span>}<span className="nv-local-badge"><span />资料保存在本机</span><button type="button" className="nv-button" onClick={refresh}><RefreshCw size={14} />重新连接</button></div></header>
     <div className="nv-workspace">
       <aside className="nv-sidebar"><button type="button" className="nv-button nv-primary nv-collect-button" onClick={openCollector}><Plus size={17} />收集视频链接</button>
         <nav className="nv-navigation" aria-label="资料视图">
@@ -238,12 +272,13 @@ export default function NetworkMediaLibrary({ active, onOpenLocal, onOpenDouyin 
         {actionError && <p className="nv-alert nv-alert-error" role="alert">{actionError}<button type="button" onClick={() => setActionError('')} aria-label="关闭错误提示"><X size={14} /></button></p>}
         {notice && <p className="nv-alert nv-alert-success" role="status"><Check size={14} />{notice}<button type="button" onClick={() => setNotice('')} aria-label="关闭操作提示"><X size={14} /></button></p>}
         {collectorOpen && <form className="nv-collector" onSubmit={event => { void collect(event); }}><div><h2><Link size={16} />粘贴分享文字或视频链接</h2>{sources.length > 0 && <button type="button" className="nv-icon-button" onClick={() => setCollectorOpen(false)} aria-label="收起收集框"><X size={16} /></button>}</div><label htmlFor="network-share-text" className="nv-sr-only">分享文字或视频链接</label><textarea ref={textarea} id="network-share-text" value={shareText} onChange={event => setShareText(event.target.value)} rows={3} placeholder="把分享文字直接粘贴到这里，也可以一行一条链接…" /><div className="nv-collector-footer"><p>每次最多 {capability?.max_batch ?? 20} 条 · 保存链接不联网，也不会自动下载</p><button type="submit" className="nv-button nv-primary" disabled={collecting || !capability || !shareText.trim()}>{collecting ? <LoaderCircle size={15} className="nv-spin" /> : <Plus size={15} />}{collecting ? '正在保存…' : '保存链接'}</button></div><p className="nv-supported">可整理抖音 / Bilibili / YouTube 分享链接及 MP4、WebM 直链。下载可用性按实际结果确认。</p></form>}
+        {collectorOpen && <TikHubPanel status={tikhub} connected={Boolean(capability)} onStatus={setTikhub} onImported={imported} />}
         <div className="nv-search-row"><label><Search size={16} /><span className="nv-sr-only">搜索资料</span><input type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索标题、标签、备注或链接" /></label>{(search || platform !== 'all') && <button type="button" onClick={() => { setSearch(''); setPlatform('all'); }}>清除筛选</button>}</div>
         <div className="nv-content-grid"><section className="nv-source-list" aria-label="已保存的视频来源">
           {loading ? <div className="nv-list-empty"><LoaderCircle size={26} className="nv-spin" /><h2>正在读取资料…</h2></div> : filtered.length === 0 ? <div className="nv-list-empty"><span className="nv-empty-icon">{view === 'archived' ? <Archive size={32} /> : <Link size={32} />}</span><h2>{sources.length ? '这里还没有匹配的资料' : '从一条视频链接开始'}</h2><p>{sources.length ? '切换视图或清除筛选后再看看。' : '把看过、想看、值得重看的视频收集起来。无需登录，先留住来源。'}</p>{!sources.length && <button type="button" className="nv-button" onClick={openCollector}><Plus size={15} />添加第一条链接</button>}</div>
             : filtered.map(source => <article className={`nv-source-card ${selectedId === source.id ? 'selected' : ''}`} key={source.id}><button type="button" className="nv-source-open" onClick={() => setSelectedId(source.id)} aria-pressed={selectedId === source.id}><div className="nv-source-meta"><PlatformMark platform={source.platform} /><span>{PLATFORM_LABELS[source.platform] || source.platform}</span><time dateTime={source.created_at}>{dateLabel(source.created_at)}</time></div><h2>{sourceDisplayTitle(source)}</h2><p className="nv-source-url">{source.url}</p>{source.tags.length > 0 && <div className="nv-tags">{source.tags.slice(0, 3).map(tag => <span key={tag}>{tag}</span>)}{source.tags.length > 3 && <span>+{source.tags.length - 3}</span>}</div>}<DownloadState source={source} compact /></button><button type="button" className={`nv-card-star ${source.starred ? 'starred' : ''}`} disabled={acting.has(source.id)} onClick={() => { void act(source, 'star'); }} aria-label={`${source.starred ? '取消' : '添加'}星标：${sourceDisplayTitle(source)}`} aria-pressed={source.starred}><Star size={16} fill={source.starred ? 'currentColor' : 'none'} /></button></article>)}
         </section>
-          {selected ? <SourceDetail key={selected.id} source={selected} draft={drafts[selected.id]} capability={capability} busy={acting.has(selected.id) || Boolean(drafts[selected.id]?.saving)} onEdit={patch => setDrafts(previous => ({ ...previous, [selected.id]: { ...previous[selected.id], ...patch } }))} onSave={revision => { void save(selected, revision); }} onToggleStar={() => { void act(selected, 'star'); }} onArchive={() => { void act(selected, 'archive'); }} onDownload={() => { void act(selected, 'download'); }} onCancel={() => { void act(selected, 'cancel'); }} />
+          {selected ? <SourceDetail key={selected.id} source={selected} draft={drafts[selected.id]} capability={capability} tikhub={tikhub} paidPrompt={paidPrompt === selected.id} busy={acting.has(selected.id) || Boolean(drafts[selected.id]?.saving)} onEdit={patch => setDrafts(previous => ({ ...previous, [selected.id]: { ...previous[selected.id], ...patch } }))} onSave={revision => { void save(selected, revision); }} onToggleStar={() => { void act(selected, 'star'); }} onArchive={() => { void act(selected, 'archive'); }} onDownload={options => { void act(selected, 'download', options); }} onCancelPaid={() => setPaidPrompt(null)} onCancel={() => { void act(selected, 'cancel'); }} />
             : <section className="nv-detail-placeholder"><FileVideo size={39} /><h2>选一条资料，展开看看</h2><p>整理标题、标签和备注，<br />需要时再下载到本机。</p><div><CircleHelp size={14} /><span>保存的是来源链接，不会自动抓取视频、登录账号或读取 Cookie。</span></div></section>}
         </div>
       </main>

@@ -132,11 +132,15 @@ export function lazy(){return function LazyComponent(){};}
 export function Suspense(){return null;}
 `);
 const jsxURL = asURL('export const jsx=(type,props)=>({type,props});export const jsxs=jsx;export const Fragment="fragment";');
-const icons = 'Archive ArrowDownToLine ArrowUpRight Check ChevronRight CircleHelp Download FileVideo FolderOpen Layers Link LoaderCircle Plus RefreshCw Save Search Star Tag Video X'.split(' ');
+const icons = 'Archive ArrowDownToLine ArrowUpRight Check ChevronRight CircleHelp Download FileVideo FolderOpen Layers Link LoaderCircle Plug Plus RefreshCw Save Search Star Tag UserRound Video X'.split(' ');
 const iconsURL = asURL(icons.map(name => `export const ${name}=()=>null;`).join(''));
 const stubURL = asURL('export default function Stub(){return null;}');
-const bridgeURL = asURL(`export * from '${apiURL}';export const networkMediaApi={capabilities:(...a)=>globalThis.__networkHarness.api.capabilities(...a),sources:(...a)=>globalThis.__networkHarness.api.sources(...a),collect:(...a)=>globalThis.__networkHarness.api.collect(...a),update:(...a)=>globalThis.__networkHarness.api.update(...a)};`);
-const { default: NetworkMediaLibrary } = await import(await moduleURL('../src/pages/NetworkMediaLibrary.tsx', { react: reactURL, 'react/jsx-runtime': jsxURL, 'lucide-react': iconsURL, '../networkMediaApi': bridgeURL }));
+// TikHub calls fall back to "provider not enabled" unless a test supplies them.
+const bridged = ['capabilities', 'sources', 'collect', 'update', 'download', 'cancel', 'tikhubStatus', 'tikhubCheck', 'tikhubResolve', 'tikhubCreator', 'tikhubImport'];
+const bridgeURL = asURL(`export * from '${apiURL}';const call=name=>(...a)=>{const f=globalThis.__networkHarness.api[name];return f?f(...a):Promise.reject(new Error(name+' unavailable'));};export const networkMediaApi={${bridged.map(name => `${name}:call('${name}')`).join(',')}};`);
+const panelURL = await moduleURL('../src/pages/TikHubPanel.tsx', { react: reactURL, 'react/jsx-runtime': jsxURL, 'lucide-react': iconsURL, '../networkMediaApi': bridgeURL });
+const { default: TikHubPanel } = await import(panelURL);
+const { default: NetworkMediaLibrary } = await import(await moduleURL('../src/pages/NetworkMediaLibrary.tsx', { react: reactURL, 'react/jsx-runtime': jsxURL, 'lucide-react': iconsURL, '../networkMediaApi': bridgeURL, './TikHubPanel': panelURL }));
 const oldApiURL = asURL('export async function loginStatus(){globalThis.__networkHarness.loginCalls++;return{status:"not_logged_in"};}');
 const { default: App } = await import(await moduleURL('../src/App.tsx', { react: reactURL, 'react/jsx-runtime': jsxURL, './pages/LandingPage': stubURL, './pages/Workspace': stubURL, './components/LoginModal': stubURL, './pages/LocalMediaWorkspace': stubURL, './pages/NetworkMediaLibrary': stubURL, './api': oldApiURL }));
 function findAll(node, predicate) {
@@ -232,4 +236,199 @@ test('default network route never polls Douyin login; the explicitly opened old 
   for (const hash of ['', '#videos', '#local', '#douyin']) {
     await harness(async ({ render, h }) => { render(App); await tick(); assert.equal(h.loginCalls, hash === '#douyin' ? 1 : 0); }, {}, hash);
   }
+});
+
+// ----- TikHub source: synthetic identifiers; no provider, token or signed address is involved. -----
+const { tikhubLookupCost, tikhubState, usesTikHub, durationLabel, safeCoverUrl, costLabel } = await import(apiURL);
+const bucket = (overrides = {}) => ({ requests: 0, succeeded: 0, failed: 0, paid_attempts: 0, billable: 0, estimated_cost_usd: 0, ...overrides });
+const tikhubStatus = (overrides = {}) => ({
+  available: true, configured: true, endpoint: 'api.tikhub.io', endpoint_valid: true, cookie_access: false, page_size: 20,
+  prices: { per_paid_request_usd: 0.001, checked_on: '2026-11-16', free: ['demo_video', 'account'] },
+  usage: { today: bucket(), total: bucket(), daily_limit: 20, remaining_today: 20 }, last_check: null,
+  comparison: { methods: {}, sources: { resolved: 0, downloaded: 0, needs_permission: 0 } }, ...overrides });
+const previewItem = (overrides = {}) => ({ item_id: '7000000000000000001', title: '合成演示作品', author: '合成作者', duration_ms: 29400, published_at: '2025-08-04T08:16:31+00:00', kind: 'video', downloadable: true, reason: null, reason_message: null, cover_url: 'https://p1.image.example.com/cover.jpeg', in_library: false, source_id: null, has_media: false, ...overrides });
+const tikhubPreview = (overrides = {}) => ({ preview_id: 'a'.repeat(32), kind: 'video', creator: null, items: [previewItem()], has_more: false, next_cursor: null, requests_used: 1, estimated_cost_usd: 0.001, usage: tikhubStatus().usage, ...overrides });
+const douyin = (overrides = {}) => sample({ id: 'douyin1', url: 'https://v.douyin.com/TestDouyinA/', platform: 'douyin', supported: true, provider: 'tikhub', platform_item_id: '7000000000000000001', title: '合成演示作品', ...overrides });
+const confirmationRequired = () => new NetworkMediaError('tikhub_confirmation_required', '需要先确认', 409);
+const text = node => JSON.stringify(node?.props?.children ?? '');
+
+test('tikhub client sends confirmations explicitly and never carries a provider token or cookie', async () => {
+  const calls = [];
+  const client = createNetworkMediaClient(async (url, options) => { calls.push({ url, options }); return json(url.endsWith('/capabilities') ? capability : tikhubPreview()); });
+  await assert.rejects(client.tikhubResolve('https://v.douyin.com/TestDouyinA/', true), /先连接/);
+  await client.capabilities();
+  await client.tikhubStatus();
+  await client.tikhubCheck('demo');
+  await client.tikhubResolve('  https://v.douyin.com/TestDouyinA/  ', false);
+  await client.tikhubCreator('https://www.douyin.com/user/MS4wLjABAAAAsynthetic', 1754000000000, true);
+  await client.tikhubImport('a'.repeat(32), ['7000000000000000001']);
+  await client.download('douyin1', { confirm_paid: true });
+  await client.download('douyin1', { method: 'anonymous' });
+  assert.deepEqual(calls.slice(1).map(call => [call.url, call.options.method ?? 'GET']), [
+    ['/api/network-media/tikhub/status', 'GET'], ['/api/network-media/tikhub/check', 'POST'], ['/api/network-media/tikhub/resolve', 'POST'],
+    ['/api/network-media/tikhub/creator', 'POST'], ['/api/network-media/tikhub/import', 'POST'],
+    ['/api/network-media/sources/douyin1/download', 'POST'], ['/api/network-media/sources/douyin1/download', 'POST']]);
+  assert.deepEqual(calls.slice(2).map(call => JSON.parse(call.options.body)), [
+    { mode: 'demo' }, { text: 'https://v.douyin.com/TestDouyinA/', confirm_paid: false },
+    { text: 'https://www.douyin.com/user/MS4wLjABAAAAsynthetic', cursor: 1754000000000, confirm_paid: true },
+    { preview_id: 'a'.repeat(32), item_ids: ['7000000000000000001'] }, { confirm_paid: true }, { method: 'anonymous' }]);
+  for (const call of calls) {
+    assert.equal(call.options.headers.get('Authorization'), null);
+    assert.equal(call.options.headers.get('Cookie'), null);
+    assert.ok(!/token|key|cookie/i.test(call.options.body ?? ''));
+  }
+  await assert.rejects(client.tikhubResolve('  ', true), /粘贴/);
+  await assert.rejects(client.tikhubImport('a'.repeat(32), []), /1–20/);
+  await assert.rejects(client.tikhubImport('a'.repeat(32), Array.from({ length: 21 }, (_, i) => String(7000000000000000000 + i))), /1–20/);
+  assert.equal(calls.length, 8);
+});
+
+test('tikhub failures show fixed guidance instead of provider text', async () => {
+  for (const [code, pattern] of [['tikhub_not_configured', /TIKHUB_API_KEY/], ['tikhub_budget_exhausted', /每日请求上限/], ['tikhub_unauthorized', /Token/], ['tikhub_payment_required', /余额/], ['private_content', /私密/], ['already_downloaded', /没有重复/], ['tikhub_preview_expired', /重新解析/]]) {
+    const client = createNetworkMediaClient(async url => url.endsWith('/capabilities') ? json(capability) : json({ detail: { code, message: 'PROVIDER-PRIVATE-TEXT Bearer secret' } }, 409));
+    await client.capabilities();
+    await assert.rejects(client.tikhubResolve('https://v.douyin.com/TestDouyinA/', true), error => error.code === code && pattern.test(error.message) && !/PROVIDER|Bearer/.test(error.message));
+  }
+});
+
+test('tikhub helpers describe cost, state and which sources use the provider', () => {
+  assert.equal(tikhubLookupCost('video', 'https://v.douyin.com/TestDouyinA/'), 1);
+  assert.equal(tikhubLookupCost('creator', 'https://www.douyin.com/user/MS4wLjABAAAAsynthetic'), 1);
+  assert.equal(tikhubLookupCost('creator', 'https://v.douyin.com/TestUserA/'), 2);
+  assert.equal(costLabel(2, 0.001), '$0.002');
+  assert.equal(durationLabel(29400), '0:29');
+  assert.equal(durationLabel(null), '');
+  assert.equal(safeCoverUrl('https://p1.image.example.com/c.jpeg'), 'https://p1.image.example.com/c.jpeg');
+  for (const unsafe of ['http://p1.image.example.com/c.jpeg', 'javascript:alert(1)', 'https://user:pw@example.com/c.jpeg', null]) assert.equal(safeCoverUrl(unsafe), undefined);
+  assert.equal(tikhubState(null), 'unavailable');
+  assert.equal(tikhubState(tikhubStatus({ configured: false })), 'unconfigured');
+  assert.equal(tikhubState(tikhubStatus()), 'configured');
+  assert.equal(tikhubState(tikhubStatus({ last_check: { mode: 'demo', ok: true } })), 'configured');
+  assert.equal(tikhubState(tikhubStatus({ last_check: { mode: 'account', ok: true } })), 'ready');
+  assert.equal(tikhubState(tikhubStatus({ last_check: { mode: 'account', ok: false } })), 'error');
+  assert.equal(tikhubState(tikhubStatus({ endpoint_valid: false })), 'error');
+  assert.equal(usesTikHub(douyin(), tikhubStatus()), true);
+  assert.equal(usesTikHub(douyin(), tikhubStatus({ configured: false })), false);
+  assert.equal(usesTikHub(douyin({ supported: false }), tikhubStatus()), false);
+  assert.equal(usesTikHub(sample(), tikhubStatus()), false);
+  assert.equal(usesTikHub(douyin(), null), false);
+});
+
+async function panelHarness(run, api, props = {}) {
+  const events = { statuses: [], imports: [] };
+  await harness(async ({ h }) => {
+    const render = () => { h.cursor = 0; return TikHubPanel({ status: tikhubStatus(), connected: true, onStatus: value => events.statuses.push(value), onImported: (result, download) => { events.imports.push({ result, download }); }, ...props }); };
+    await run({ render, events });
+  }, api);
+}
+const panelForm = tree => findAll(tree, node => node.type === 'form')[0];
+const dialog = tree => findAll(tree, node => node.props?.role === 'alertdialog')[0];
+const button = (tree, label) => findAll(tree, node => node.type === 'button' && text(node).includes(label))[0];
+
+test('tikhub panel shows connection state and hides lookups until a token is configured', async () => {
+  await panelHarness(async ({ render }) => {
+    const tree = render();
+    assert.ok(findAll(tree, node => node.props?.role === 'status').some(node => text(node).includes('未配置 Token')));
+    assert.equal(panelForm(tree), undefined);
+    assert.ok(text(tree).includes('TIKHUB_API_KEY') && text(tree).includes('匿名下载方式'));
+    assert.equal(button(tree, '免费 Demo 测试').props.disabled, false);
+    assert.equal(button(tree, '检查 Token').props.disabled, true);
+  }, {}, { status: tikhubStatus({ configured: false }) });
+  await panelHarness(async ({ render }) => { assert.equal(render(), null); }, {}, { status: null });
+});
+
+test('a paid lookup is sent only after the user confirms that one request', async () => {
+  const requests = [];
+  await panelHarness(async ({ render }) => {
+    let tree = render();
+    findAll(tree, node => node.type === 'input' && node.props.id === 'tikhub-link')[0].props.onChange({ target: { value: 'https://v.douyin.com/TestDouyinA/' } }); tree = render();
+    assert.equal(dialog(tree), undefined);
+    panelForm(tree).props.onSubmit({ preventDefault() {} }); await tick(); tree = render();
+    assert.deepEqual(requests, [['https://v.douyin.com/TestDouyinA/', false]]);
+    assert.ok(text(dialog(tree)).includes('$0.001') && text(dialog(tree)).includes('TikHub 账单'));
+    assert.equal(findAll(tree, node => node.props?.className === 'nv-tk-preview')[0], undefined);
+    button(dialog(tree), '取消').props.onClick(); tree = render();
+    assert.equal(dialog(tree), undefined);
+    assert.equal(requests.length, 1);
+    panelForm(tree).props.onSubmit({ preventDefault() {} }); await tick(); tree = render();
+    button(dialog(tree), '确认并发送').props.onClick(); await tick(); tree = render();
+    assert.deepEqual(requests.at(-1), ['https://v.douyin.com/TestDouyinA/', true]);
+    assert.equal(dialog(tree), undefined);
+    assert.ok(text(tree).includes('本次使用') && text(tree).includes('合成演示作品'));
+  }, { tikhubResolve: async (value, confirmed) => { requests.push([value, confirmed]); if (!confirmed) throw confirmationRequired(); return tikhubPreview(); } });
+});
+
+test('a post already in the library is previewed without a prompt or a request', async () => {
+  await panelHarness(async ({ render }) => {
+    let tree = render();
+    findAll(tree, node => node.type === 'input' && node.props.id === 'tikhub-link')[0].props.onChange({ target: { value: 'https://www.douyin.com/video/7000000000000000001' } }); tree = render();
+    panelForm(tree).props.onSubmit({ preventDefault() {} }); await tick(); tree = render();
+    assert.equal(dialog(tree), undefined);
+    assert.ok(text(tree).includes('未发送请求') && text(tree).includes('已下载到本机'));
+    const box = findAll(tree, node => node.type === 'input' && node.props.type === 'checkbox' && node.props['aria-label'])[0];
+    assert.equal(box.props.disabled, true);
+    assert.equal(button(tree, '加入并下载').props.disabled, true);
+  }, { tikhubResolve: async () => tikhubPreview({ requests_used: 0, estimated_cost_usd: 0, items: [previewItem({ in_library: true, has_media: true, source_id: 'douyin1' })] }) });
+});
+
+test('creator preview lets the user tick posts and import only the selection', async () => {
+  const imported = [];
+  const items = [previewItem(), previewItem({ item_id: '7000000000000000002', title: '第二条' }), previewItem({ item_id: '7000000000000000003', title: '图文', kind: 'images', downloadable: false, reason: 'image_post', reason_message: '这是图文作品，没有可下载的视频文件；来源已保留。' })];
+  await panelHarness(async ({ render, events }) => {
+    let tree = render();
+    button(tree, '导入博主公开视频').props.onClick(); tree = render();
+    findAll(tree, node => node.type === 'input' && node.props.id === 'tikhub-link')[0].props.onChange({ target: { value: 'https://v.douyin.com/TestUserA/' } }); tree = render();
+    panelForm(tree).props.onSubmit({ preventDefault() {} }); await tick(); tree = render();
+    assert.ok(text(dialog(tree)).includes('2') && text(dialog(tree)).includes('$0.002'));
+    button(dialog(tree), '确认并发送').props.onClick(); await tick(); tree = render();
+    assert.ok(text(tree).includes('合成作者') && text(tree).includes('图文作品'));
+    const boxes = () => findAll(tree, node => node.type === 'input' && node.props.type === 'checkbox' && node.props['aria-label']);
+    assert.deepEqual(boxes().map(box => box.props.checked), [true, true, true]);
+    boxes()[1].props.onChange(); tree = render();
+    assert.ok(text(tree).includes('已选') && boxes()[1].props.checked === false);
+    assert.equal(button(tree, '下一页').props.disabled, false);
+    button(tree, '加入并下载').props.onClick(); await tick(); tree = render();
+    assert.deepEqual(imported, [['b'.repeat(32), ['7000000000000000001', '7000000000000000003']]]);
+    assert.equal(events.imports[0].download, true);
+    assert.equal(findAll(tree, node => node.props?.className === 'nv-tk-preview')[0], undefined);
+  }, {
+    tikhubCreator: async (value, cursor, confirmed) => { if (!confirmed) throw confirmationRequired(); return tikhubPreview({ preview_id: 'b'.repeat(32), kind: 'creator', creator: { sec_user_id: 'MS4wLjABAAAAsynthetic', nickname: '合成作者', url: 'https://www.douyin.com/user/MS4wLjABAAAAsynthetic' }, items, has_more: true, next_cursor: 1754000000000, requests_used: 2, estimated_cost_usd: 0.002 }); },
+    tikhubImport: async (id, ids) => { imported.push([id, ids]); return { items: [douyin()], created: 2, duplicates: 0 }; },
+  });
+});
+
+test('free checks report their result and failed lookups keep the pasted link', async () => {
+  await panelHarness(async ({ render, events }) => {
+    let tree = render();
+    button(tree, '免费 Demo 测试').props.onClick(); await tick(); tree = render();
+    assert.equal(events.statuses.at(-1).last_check.ok, true);
+    findAll(tree, node => node.type === 'input' && node.props.id === 'tikhub-link')[0].props.onChange({ target: { value: 'https://v.douyin.com/TestDouyinA/' } }); tree = render();
+    panelForm(tree).props.onSubmit({ preventDefault() {} }); await tick(); tree = render();
+    assert.ok(findAll(tree, node => node.props?.role === 'alert').some(node => text(node).includes('每日请求上限')));
+    assert.equal(findAll(tree, node => node.type === 'input' && node.props.id === 'tikhub-link')[0].props.value, 'https://v.douyin.com/TestDouyinA/');
+  }, {
+    tikhubCheck: async mode => ({ mode, ok: true, status: tikhubStatus({ last_check: { mode, ok: true, sample: { title: '合成演示作品', candidates: 5, codec: 'h264' } } }) }),
+    tikhubResolve: async () => { throw new NetworkMediaError('tikhub_budget_exhausted', '已达到本机设置的 TikHub 每日请求上限，没有发送请求。', 409); },
+  });
+});
+
+test('downloading a douyin source through tikhub asks before any paid request', async () => {
+  const downloads = [];
+  await harness(async ({ render }) => {
+    render(); await tick(); let tree = render();
+    assert.equal(detail(tree).props.paidPrompt, false);
+    detail(tree).props.onDownload(); await tick(); tree = render();
+    assert.deepEqual(downloads, [{}]);
+    assert.equal(detail(tree).props.paidPrompt, true);
+    assert.equal(findAll(tree, node => node.props?.role === 'alert').length, 0);
+    detail(tree).props.onCancelPaid(); tree = render();
+    assert.equal(detail(tree).props.paidPrompt, false);
+    detail(tree).props.onDownload({ confirm_paid: true }); await tick(); tree = render();
+    assert.deepEqual(downloads, [{}, { confirm_paid: true }]);
+    assert.equal(detail(tree).props.source.status, 'queued');
+    assert.equal(detail(tree).props.paidPrompt, false);
+  }, {
+    capabilities: async () => capability, sources: async () => ({ items: [douyin()] }), tikhubStatus: async () => tikhubStatus(),
+    download: async (id, options) => { downloads.push(options); if (!options.confirm_paid) throw confirmationRequired(); return douyin({ status: 'queued', download_id: 'attempt1' }); },
+  });
 });

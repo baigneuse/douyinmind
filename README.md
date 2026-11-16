@@ -122,6 +122,7 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 | `DASHSCOPE_API_KEY` | 声音识别及将文字转换为可检索的数字表示 |
 | `QWEN_OMNI_API_KEY` | 可选；声音模型使用单独密钥时填写，否则复用百炼密钥 |
 | `QWEN_OMNI_BASE_URL`、`EMBEDDING_BASE_URL` | 与密钥所属服务区域保持一致 |
+| `TIKHUB_API_KEY` | 可选；通过 TikHub 解析和下载抖音公开作品，按次计费并逐次确认，见[网络视频资料库](docs/NETWORK_VIDEO_LIBRARY.md#tikhub-抖音数据源可选) |
 
 模板使用 `deepseek-flash`、`qwen3.8-omni-flash` 和 `text-embedding-v4` 作为模型标识。请保留在本地配置中，按自己账号的可用模型调整；不要把实际密钥写进源码或提交记录。
 

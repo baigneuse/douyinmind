@@ -7,7 +7,7 @@
 import os
 from pathlib import Path
 from typing import Literal
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 from pydantic_settings import BaseSettings
 
@@ -45,6 +45,17 @@ class Settings(BaseSettings):
     video_cache_dir: str = "app/storage/video_cache"
     ingestion_metrics_dir: str = "app/storage/ingestion_runs"
     long_video_test_keep_audio: bool = False
+
+    # ===== TikHub 抖音数据源（可选）=====
+    tikhub_api_key: SecretStr = SecretStr("")
+    """TikHub API Token；仅保存在本机 .env，由后端放入请求头，不写入日志、记录或前端"""
+
+    tikhub_base_url: str = "https://api.tikhub.io"
+    """TikHub 官方服务地址；只接受 https://api.tikhub.io"""
+
+    tikhub_timeout_seconds: float = Field(default=45.0, ge=5, le=60)
+    tikhub_daily_request_limit: int = Field(default=20, ge=0, le=1000)
+    """本机每日 TikHub 付费请求上限；达到后不再发送请求"""
 
     # ===== LLM 配置 =====
     llm_model: str = "deepseek-chat"

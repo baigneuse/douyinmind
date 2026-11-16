@@ -58,6 +58,7 @@ backend/scripts/*
 !backend/scripts/long_video_test.py
 !backend/scripts/observe_ingestion.py
 !backend/scripts/import_local.py
+!backend/scripts/tikhub_check.py
 backend/tests/test_journal*.py
 
 # 原本机界面截图含实际收藏夹名称；原图留在本地

@@ -23,11 +23,11 @@ import urllib.parse
 import urllib.request
 
 if __package__:
-    from .network_download import (MAX_BYTES, MAX_DURATION_MS, NetworkDownloadError,
+    from .network_download import (MAX_BYTES, MAX_DURATION_MS, MAX_PROVIDED_MEDIA, NetworkDownloadError,
                                    _public_ip, _safe_text, _source, _validate_url)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from network_download import (MAX_BYTES, MAX_DURATION_MS, NetworkDownloadError,
+    from network_download import (MAX_BYTES, MAX_DURATION_MS, MAX_PROVIDED_MEDIA, NetworkDownloadError,
                                   _public_ip, _safe_text, _source, _validate_url)
 
 
@@ -309,6 +309,34 @@ def _download(url: str, path: Path, headers: dict, consumed: int) -> int:
     return consumed + written
 
 
+_PROVIDED_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+                                   'Chrome/130.0.0.0 Safari/537.36', 'Referer': 'https://www.douyin.com/'}
+
+
+def _download_provided(media: dict, path: Path) -> tuple[dict, int]:
+    """Fetch the first working address a data provider resolved for one video.
+
+    No extractor, cookie or credential is involved: only public media URLs
+    arrive here, and each one passes the same guarded transport as a direct link.
+    """
+    candidates = media.get('candidates') if isinstance(media, dict) else None
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= MAX_PROVIDED_MEDIA:
+        raise NetworkDownloadError('unsupported_source')
+    urls = [candidate.get('url') if isinstance(candidate, dict) else None for candidate in candidates]
+    for url in urls:
+        _validate_url(url)
+    failure: Exception = NetworkDownloadError('download_failed')
+    for url in urls:
+        try:
+            consumed = _download(url, path, _PROVIDED_HEADERS, 0)
+        except Exception as error:  # A mirror may be expired or refused; try the next one.
+            failure = error
+            path.unlink(missing_ok=True)
+            continue
+        return {'title': media.get('title'), 'uploader': media.get('author')}, consumed
+    raise failure
+
+
 def _local_process(popen, command: list[str], *, timeout: int = 90, metadata: bool = False) -> bytes:
     # Call the saved constructor only for fixed local ffmpeg/ffprobe commands.
     process = popen(command, stdout=subprocess.DEVNULL if metadata else subprocess.PIPE,
@@ -385,9 +413,14 @@ def run(request: dict):
     _validate_url(url, source=True)
     _emit('progress', stage='resolving')
     with public_connections_only(request.get('deno')) as popen:
-        info = _extract(url, request.get('deno'))
-        formats = _choose_formats(info)
         consumed, inputs = 0, []
+        if request.get('media') is not None:
+            info, consumed = _download_provided(request['media'], target / 'track-0.part')
+            inputs.append(target / 'track-0.part')
+            formats = []
+        else:
+            info = _extract(url, request.get('deno'))
+            formats = _choose_formats(info)
         for index, f in enumerate(formats):
             path = target / f'track-{index}.part'
             headers = dict(info.get('http_headers') or {})
